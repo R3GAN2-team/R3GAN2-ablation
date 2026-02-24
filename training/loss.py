@@ -16,16 +16,16 @@ import torch
 
 class R3GANLoss:
     def __init__(self, G, D, augment_pipe=None):
-        self.trainer = AdversarialTraining(G, D)
         if augment_pipe is not None:
-            self.preprocessor = lambda x: augment_pipe(x.to(torch.float32)).to(x.dtype)
+            preprocessor = lambda images_list: [y.to(images_list[0].dtype) for y in augment_pipe([x.to(torch.float32) for x in images_list])]
+            self.trainer = AdversarialTraining(G, D, preprocessor)
         else:
-            self.preprocessor = lambda x: x
+            self.trainer = AdversarialTraining(G, D)
         
     def accumulate_gradients(self, phase, real_img, real_c, gen_z, gamma, gain):
         # G
         if phase == 'G':
-            AdversarialLoss, RelativisticLogits = self.trainer.AccumulateGeneratorGradients(gen_z, real_img, real_c, gain, self.preprocessor)
+            AdversarialLoss, RelativisticLogits = self.trainer.AccumulateGeneratorGradients(gen_z, real_img, real_c, gain)
             
             training_stats.report('Loss/scores/fake', RelativisticLogits)
             training_stats.report('Loss/signs/fake', RelativisticLogits.sign())
@@ -33,7 +33,7 @@ class R3GANLoss:
             
         # D
         if phase == 'D':
-            AdversarialLoss, RelativisticLogits, R1Penalty, R2Penalty = self.trainer.AccumulateDiscriminatorGradients(gen_z, real_img, real_c, gamma, gain, self.preprocessor)
+            AdversarialLoss, RelativisticLogits, R1Penalty, R2Penalty = self.trainer.AccumulateDiscriminatorGradients(gen_z, real_img, real_c, gamma, gain)
             
             training_stats.report('Loss/scores/real', RelativisticLogits)
             training_stats.report('Loss/signs/real', RelativisticLogits.sign())

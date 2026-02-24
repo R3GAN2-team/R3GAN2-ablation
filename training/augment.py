@@ -62,14 +62,6 @@ def translate2d(tx, ty, **kwargs):
         [0, 0, 1],
         **kwargs)
 
-def translate3d(tx, ty, tz, **kwargs):
-    return matrix(
-        [1, 0, 0, tx],
-        [0, 1, 0, ty],
-        [0, 0, 1, tz],
-        [0, 0, 0, 1],
-        **kwargs)
-
 def scale2d(sx, sy, **kwargs):
     return matrix(
         [sx, 0,  0],
@@ -77,29 +69,11 @@ def scale2d(sx, sy, **kwargs):
         [0,  0,  1],
         **kwargs)
 
-def scale3d(sx, sy, sz, **kwargs):
-    return matrix(
-        [sx, 0,  0,  0],
-        [0,  sy, 0,  0],
-        [0,  0,  sz, 0],
-        [0,  0,  0,  1],
-        **kwargs)
-
 def rotate2d(theta, **kwargs):
     return matrix(
         [torch.cos(theta), torch.sin(-theta), 0],
         [torch.sin(theta), torch.cos(theta),  0],
         [0,                0,                 1],
-        **kwargs)
-
-def rotate3d(v, theta, **kwargs):
-    vx = v[..., 0]; vy = v[..., 1]; vz = v[..., 2]
-    s = torch.sin(theta); c = torch.cos(theta); cc = 1 - c
-    return matrix(
-        [vx*vx*cc+c,    vx*vy*cc-vz*s, vx*vz*cc+vy*s, 0],
-        [vy*vx*cc+vz*s, vy*vy*cc+c,    vy*vz*cc-vx*s, 0],
-        [vz*vx*cc-vy*s, vz*vy*cc+vx*s, vz*vz*cc+c,    0],
-        [0,             0,             0,             1],
         **kwargs)
 
 def translate2d_inv(tx, ty, **kwargs):
@@ -110,6 +84,47 @@ def scale2d_inv(sx, sy, **kwargs):
 
 def rotate2d_inv(theta, **kwargs):
     return rotate2d(-theta, **kwargs)
+
+def translate_channels(num_channels, t):
+    C = torch.eye(num_channels + 1, device=t.device).unsqueeze(0).repeat(t.shape[0], 1, 1)
+    for i in range(num_channels):
+        C[:, i, -1] = t
+    return C.clone()
+
+def scale_channels(num_channels, s):
+    C = torch.eye(num_channels + 1, device=s.device).unsqueeze(0).repeat(s.shape[0], 1, 1)
+    for i in range(num_channels):
+        C[:, i, i] = s
+    return C.clone()
+
+def generate_orthogonal_span(v):
+    v = v[:-1]
+    
+    sorted_idx = torch.argsort(v.abs())
+    i = sorted_idx[0].item()
+    j = sorted_idx[1].item()
+    
+    e_i = torch.zeros_like(v)
+    e_i[i] = 1
+    e_j = torch.zeros_like(v)
+    e_j[j] = 1
+    
+    u = e_i - (v @ e_i) * v
+    u = u / u.norm()
+    
+    w = e_j - (v @ e_j) * v - (u @ e_j) / (u @ u) * u
+    w = w / w.norm()
+    
+    S = torch.outer(u, w) - torch.outer(w, u)
+    return S.clone()
+
+def rotate_channels(S, theta):
+    C = torch.eye(S.shape[0] + 1, device=theta.device).unsqueeze(0).repeat(theta.shape[0], 1, 1)
+    S = S.unsqueeze(0).repeat(theta.shape[0], 1, 1)
+    theta = -theta.view(-1, 1, 1)
+    R = torch.matrix_exp(S * theta)
+    C[:, :R.shape[1], :R.shape[2]] = R
+    return C.clone()
 
 #----------------------------------------------------------------------------
 # Versatile image augmentation pipeline from the paper
@@ -183,10 +198,10 @@ class AugmentPipe(torch.nn.Module):
             Hz_fbank[i, (Hz_fbank.shape[1] - Hz_hi2.size) // 2 : (Hz_fbank.shape[1] + Hz_hi2.size) // 2] += Hz_hi2
         self.register_buffer('Hz_fbank', torch.as_tensor(Hz_fbank, dtype=torch.float32))
 
-    def forward(self, images, debug_percentile=None):
-        assert isinstance(images, torch.Tensor) and images.ndim == 4
-        batch_size, num_channels, height, width = images.shape
-        device = images.device
+    def forward(self, images_list, debug_percentile=None):
+        # assert isinstance(images, torch.Tensor) and images.ndim == 4
+        batch_size, num_channels, height, width = images_list[0].shape
+        device = images_list[0].device
         if debug_percentile is not None:
             debug_percentile = torch.as_tensor(debug_percentile, dtype=torch.float32, device=device)
 
@@ -288,30 +303,30 @@ class AugmentPipe(torch.nn.Module):
             mx0, my0, mx1, my1 = margin.ceil().to(torch.int32)
 
             # Pad image and adjust origin.
-            images = torch.nn.functional.pad(input=images, pad=[mx0,mx1,my0,my1], mode='reflect')
+            images_list = [torch.nn.functional.pad(input=images, pad=[mx0,mx1,my0,my1], mode='reflect') for images in images_list]
             G_inv = translate2d((mx0 - mx1) / 2, (my0 - my1) / 2) @ G_inv
 
             # Upsample.
-            images = upfirdn2d.upsample2d(x=images, f=self.Hz_geom, up=2)
+            images_list = [upfirdn2d.upsample2d(x=images, f=self.Hz_geom, up=2) for images in images_list]
             G_inv = scale2d(2, 2, device=device) @ G_inv @ scale2d_inv(2, 2, device=device)
             G_inv = translate2d(-0.5, -0.5, device=device) @ G_inv @ translate2d_inv(-0.5, -0.5, device=device)
 
             # Execute transformation.
             shape = [batch_size, num_channels, (height + Hz_pad * 2) * 2, (width + Hz_pad * 2) * 2]
-            G_inv = scale2d(2 / images.shape[3], 2 / images.shape[2], device=device) @ G_inv @ scale2d_inv(2 / shape[3], 2 / shape[2], device=device)
+            G_inv = scale2d(2 / images_list[0].shape[3], 2 / images_list[0].shape[2], device=device) @ G_inv @ scale2d_inv(2 / shape[3], 2 / shape[2], device=device)
             grid = torch.nn.functional.affine_grid(theta=G_inv[:,:2,:], size=shape, align_corners=False)
-            images = grid_sample_gradfix.grid_sample(images, grid)
+            images_list = [grid_sample_gradfix.grid_sample(images, grid) for images in images_list]
 
             # Downsample and crop.
-            images = upfirdn2d.downsample2d(x=images, f=self.Hz_geom, down=2, padding=-Hz_pad*2, flip_filter=True)
+            images_list = [upfirdn2d.downsample2d(x=images, f=self.Hz_geom, down=2, padding=-Hz_pad*2, flip_filter=True) for images in images_list]
 
         # --------------------------------------------
         # Select parameters for color transformations.
         # --------------------------------------------
 
         # Initialize homogeneous 3D transformation matrix: C @ color_in ==> color_out
-        I_4 = torch.eye(4, device=device)
-        C = I_4
+        I_C = torch.eye(num_channels + 1, device=device)
+        C = I_C
 
         # Apply brightness with probability (brightness * strength).
         if self.brightness > 0:
@@ -319,56 +334,50 @@ class AugmentPipe(torch.nn.Module):
             b = torch.where(torch.rand([batch_size], device=device) < self.brightness * self.p, b, torch.zeros_like(b))
             if debug_percentile is not None:
                 b = torch.full_like(b, torch.erfinv(debug_percentile * 2 - 1) * self.brightness_std)
-            C = translate3d(b, b, b) @ C
-
+            C = translate_channels(num_channels, b) @ C
+            
         # Apply contrast with probability (contrast * strength).
         if self.contrast > 0:
             c = torch.exp2(torch.randn([batch_size], device=device) * self.contrast_std)
             c = torch.where(torch.rand([batch_size], device=device) < self.contrast * self.p, c, torch.ones_like(c))
             if debug_percentile is not None:
                 c = torch.full_like(c, torch.exp2(torch.erfinv(debug_percentile * 2 - 1) * self.contrast_std))
-            C = scale3d(c, c, c) @ C
-
+            C = scale_channels(num_channels, c) @ C
+            
         # Apply luma flip with probability (lumaflip * strength).
-        v = misc.constant(np.asarray([1, 1, 1, 0]) / np.sqrt(3), device=device) # Luma axis.
+        v = misc.constant(np.asarray([1 for _ in range(num_channels)] + [0]) / np.sqrt(num_channels), device=device) # Luma axis.
         if self.lumaflip > 0:
             i = torch.floor(torch.rand([batch_size, 1, 1], device=device) * 2)
             i = torch.where(torch.rand([batch_size, 1, 1], device=device) < self.lumaflip * self.p, i, torch.zeros_like(i))
             if debug_percentile is not None:
                 i = torch.full_like(i, torch.floor(debug_percentile * 2))
-            C = (I_4 - 2 * v.ger(v) * i) @ C # Householder reflection.
+            C = (I_C - 2 * v.ger(v) * i) @ C # Householder reflection.
 
         # Apply hue rotation with probability (hue * strength).
-        if self.hue > 0 and num_channels > 1:
+        if self.hue > 0:
             theta = (torch.rand([batch_size], device=device) * 2 - 1) * np.pi * self.hue_max
             theta = torch.where(torch.rand([batch_size], device=device) < self.hue * self.p, theta, torch.zeros_like(theta))
             if debug_percentile is not None:
                 theta = torch.full_like(theta, (debug_percentile * 2 - 1) * np.pi * self.hue_max)
-            C = rotate3d(v, theta) @ C # Rotate around v.
-
+            C = rotate_channels(generate_orthogonal_span(v), theta) @ C # Rotate around v.
+            
         # Apply saturation with probability (saturation * strength).
-        if self.saturation > 0 and num_channels > 1:
+        if self.saturation > 0:
             s = torch.exp2(torch.randn([batch_size, 1, 1], device=device) * self.saturation_std)
             s = torch.where(torch.rand([batch_size, 1, 1], device=device) < self.saturation * self.p, s, torch.ones_like(s))
             if debug_percentile is not None:
                 s = torch.full_like(s, torch.exp2(torch.erfinv(debug_percentile * 2 - 1) * self.saturation_std))
-            C = (v.ger(v) + (I_4 - v.ger(v)) * s) @ C
+            C = (v.ger(v) + (I_C - v.ger(v)) * s) @ C
 
         # ------------------------------
         # Execute color transformations.
         # ------------------------------
 
         # Execute if the transform is not identity.
-        if C is not I_4:
-            images = images.reshape([batch_size, num_channels, height * width])
-            if num_channels == 3:
-                images = C[:, :3, :3] @ images + C[:, :3, 3:]
-            elif num_channels == 1:
-                C = C[:, :3, :].mean(dim=1, keepdims=True)
-                images = images * C[:, :, :3].sum(dim=2, keepdims=True) + C[:, :, 3:]
-            else:
-                raise ValueError('Image must be RGB (3 channels) or L (1 channel)')
-            images = images.reshape([batch_size, num_channels, height, width])
+        if C is not I_C:
+            images_list = [images.reshape([batch_size, num_channels, height * width]) for images in images_list]
+            images_list = [(C[:, :num_channels, :num_channels] @ images + C[:, :num_channels, num_channels:]) for images in images_list]
+            images_list = [images.reshape([batch_size, num_channels, height, width]) for images in images_list]
 
         # ----------------------
         # Image-space filtering.
@@ -398,11 +407,11 @@ class AugmentPipe(torch.nn.Module):
 
             # Apply filter.
             p = self.Hz_fbank.shape[1] // 2
-            images = images.reshape([1, batch_size * num_channels, height, width])
-            images = torch.nn.functional.pad(input=images, pad=[p,p,p,p], mode='reflect')
-            images = conv2d_gradfix.conv2d(input=images, weight=Hz_prime.unsqueeze(2), groups=batch_size*num_channels)
-            images = conv2d_gradfix.conv2d(input=images, weight=Hz_prime.unsqueeze(3), groups=batch_size*num_channels)
-            images = images.reshape([batch_size, num_channels, height, width])
+            images_list = [images.reshape([1, batch_size * num_channels, height, width]) for images in images_list]
+            images_list = [torch.nn.functional.pad(input=images, pad=[p,p,p,p], mode='reflect') for images in images_list]
+            images_list = [conv2d_gradfix.conv2d(input=images, weight=Hz_prime.unsqueeze(2), groups=batch_size*num_channels) for images in images_list]
+            images_list = [conv2d_gradfix.conv2d(input=images, weight=Hz_prime.unsqueeze(3), groups=batch_size*num_channels) for images in images_list]
+            images_list = [images.reshape([batch_size, num_channels, height, width]) for images in images_list]
 
         # ------------------------
         # Image-space corruptions.
@@ -414,7 +423,7 @@ class AugmentPipe(torch.nn.Module):
             sigma = torch.where(torch.rand([batch_size, 1, 1, 1], device=device) < self.noise * self.p, sigma, torch.zeros_like(sigma))
             if debug_percentile is not None:
                 sigma = torch.full_like(sigma, torch.erfinv(debug_percentile) * self.noise_std)
-            images = images + torch.randn([batch_size, num_channels, height, width], device=device) * sigma
+            images_list = [(images + torch.randn([batch_size, num_channels, height, width], device=device) * sigma) for images in images_list]
 
         # Apply cutout with probability (cutout * strength).
         if self.cutout > 0:
@@ -430,8 +439,14 @@ class AugmentPipe(torch.nn.Module):
             mask_y = (((coord_y + 0.5) / height - center[:, 1]).abs() >= size[:, 1] / 2)
             mask_x, mask_y = torch.broadcast_tensors(mask_x, mask_y)
             mask = torch.logical_or(mask_x, mask_y).to(torch.float32)
-            images = images * mask
 
-        return images
+            results = []
+            for images in images_list:
+                std, mean = torch.std_mean(images, correction=0, dim=[2, 3], keepdim=True)
+                noise = std * torch.randn([batch_size, num_channels, height, width], device=device) + mean
+                results += [images * mask + noise * (1 - mask)]
+            images_list = results
+
+        return images_list
 
 #----------------------------------------------------------------------------
