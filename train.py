@@ -179,7 +179,6 @@ def main(**kwargs):
         WidthPerStage = [3 * x // 4 for x in [1024, 1024, 1024, 1024]]
         BlocksPerStage = [2 * x for x in [1, 1, 1, 1]]
         CardinalityPerStage = [3 * x for x in [32, 32, 32, 32]]
-        FP16Stages = [-1, -2, -3]
         NoiseDimension = 64
         
         if opts.cond:
@@ -199,7 +198,6 @@ def main(**kwargs):
         WidthPerStage = [3 * x // 4 for x in [1024, 1024, 1024, 1024, 512]]
         BlocksPerStage = [2 * x for x in [1, 1, 1, 1, 1]]
         CardinalityPerStage = [3 * x for x in [32, 32, 32, 32, 16]]
-        FP16Stages = [-1, -2, -3, -4]
         NoiseDimension = 64
        
         ema_nimg = 500 * 1000
@@ -215,7 +213,6 @@ def main(**kwargs):
         WidthPerStage = [3 * x // 4 for x in [1024, 1024, 1024, 1024, 512, 256, 128]]
         BlocksPerStage = [2 * x for x in [1, 1, 1, 1, 1, 1, 1]]
         CardinalityPerStage = [3 * x for x in [32, 32, 32, 32, 16, 8, 4]]
-        FP16Stages = [-1, -2, -3, -4]
         NoiseDimension = 64
        
         ema_nimg = 500 * 1000
@@ -231,7 +228,6 @@ def main(**kwargs):
         WidthPerStage = [6 * x // 4 for x in [1024, 1024, 1024, 1024]]
         BlocksPerStage = [2 * x for x in [1, 1, 1, 1]]
         CardinalityPerStage = [3 * x for x in [32, 32, 32, 32]]
-        FP16Stages = [-1, -2, -3]
         NoiseDimension = 64
        
         c.G_kwargs.ConditionEmbeddingDimension = NoiseDimension
@@ -250,7 +246,6 @@ def main(**kwargs):
         WidthPerStage = [6 * x // 4 for x in [1024, 1024, 1024, 1024, 1024]]
         BlocksPerStage = [2 * x for x in [1, 1, 1, 1, 1]]
         CardinalityPerStage = [3 * x for x in [32, 32, 32, 32, 32]]
-        FP16Stages = [-1, -2, -3, -4]
         NoiseDimension = 64
         
         c.G_kwargs.ConditionEmbeddingDimension = NoiseDimension
@@ -270,13 +265,11 @@ def main(**kwargs):
     c.G_kwargs.CardinalityPerStage = CardinalityPerStage
     c.G_kwargs.BlocksPerStage = BlocksPerStage
     c.G_kwargs.ExpansionFactor = 2
-    c.G_kwargs.FP16Stages = FP16Stages
     
     c.D_kwargs.WidthPerStage = [*reversed(WidthPerStage)]
     c.D_kwargs.CardinalityPerStage = [*reversed(CardinalityPerStage)]
     c.D_kwargs.BlocksPerStage = [*reversed(BlocksPerStage)]
     c.D_kwargs.ExpansionFactor = 2
-    c.D_kwargs.FP16Stages = [x + len(FP16Stages) for x in FP16Stages]
     
     
     c.metrics = opts.metrics
