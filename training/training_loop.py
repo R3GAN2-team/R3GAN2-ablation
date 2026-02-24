@@ -79,8 +79,8 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
 
 #----------------------------------------------------------------------------
 
-def save_image_grid(img, fname, drange, grid_size):
-    lo, hi = drange
+def save_image_grid(img, fname, grid_size):
+    lo, hi = [0,255]
     img = np.asarray(img, dtype=np.float32)
     img = (img - lo) * (255 / (hi - lo))
     img = np.rint(img).clip(0, 255).astype(np.uint8)
@@ -119,6 +119,7 @@ def remap_optimizer_state_dict(state_dict, device):
 def training_loop(
     run_dir                 = '.',      # Output directory.
     training_set_kwargs     = {},       # Options for training set.
+    eval_set_kwargs         = {},       # Options for eval set.
     data_loader_kwargs      = {},       # Options for torch.utils.data.DataLoader.
     G_kwargs                = {},       # Options for generator network.
     D_kwargs                = {},       # Options for discriminator network.
@@ -161,20 +162,36 @@ def training_loop(
     # Load training set.
     if rank == 0:
         print('Loading training set...')
+    eval_set = dnnlib.util.construct_class_by_name(**eval_set_kwargs) # subclass of training.dataset.Dataset
     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs) # subclass of training.dataset.Dataset
     training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
     training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, **data_loader_kwargs))
+
+    if rank == 0:
+        print('Setting up encoder...')
+    if training_set.num_channels == 3:
+        encoder_kwargs = dnnlib.EasyDict(class_name='training.encoders.StandardRGBEncoder')
+    elif training_set.num_channels == 8:
+        encoder_kwargs = dnnlib.EasyDict(class_name='training.encoders.StabilityVAEEncoder')
+    else:
+        encoder_kwargs = dnnlib.EasyDict(class_name='training.encoders.Flux2VAEEncoder')
+    encoder = dnnlib.util.construct_class_by_name(**encoder_kwargs)
+    
+    ref_image, _ = training_set[0]
+    ref_image = encoder.encode_latents(torch.as_tensor(ref_image).to(device).unsqueeze(0))
+    
     if rank == 0:
         print()
         print('Num images: ', len(training_set))
-        print('Image shape:', training_set.image_shape)
+        print('Image shape:', list(ref_image[0].shape))
         print('Label shape:', training_set.label_shape)
         print()
+        
 
     # Construct networks.
     if rank == 0:
         print('Constructing networks...')
-    common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=training_set.resolution)
+    common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=training_set.resolution, img_channels=ref_image.shape[1])
     G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     G_ema = copy.deepcopy(G).eval()
@@ -240,12 +257,12 @@ def training_loop(
     grid_c = None
     if rank == 0:
         print('Exporting sample images...')
-        grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
-        save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
+        grid_size, images, labels = setup_snapshot_image_grid(training_set=eval_set)
+        save_image_grid(images, os.path.join(run_dir, 'reals.png'), grid_size=grid_size)
         grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(g_batch_gpu)
         grid_c = torch.from_numpy(labels).to(device).split(g_batch_gpu)
-        images = torch.cat([G_ema(z, c).cpu() for z, c in zip(grid_z, grid_c)]).to(torch.float).numpy()
-        save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
+        images = torch.cat([encoder.decode(G_ema(z, c)).cpu() for z, c in zip(grid_z, grid_c)]).to(torch.float).numpy()
+        save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), grid_size=grid_size)
 
     # Initialize logs.
     if rank == 0:
@@ -286,9 +303,11 @@ def training_loop(
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
             D_img, D_img_c = next(training_set_iterator)
+            D_img = encoder.encode_latents(D_img.to(device))
             D_z = torch.randn([batch_size, G.z_dim], device=device)
             
             G_img, G_img_c = next(training_set_iterator)
+            G_img = encoder.encode_latents(G_img.to(device))
             G_z = torch.randn([batch_size, G.z_dim], device=device)
             
             all_real_img = []
@@ -296,15 +315,15 @@ def training_loop(
             all_gen_z = []
             
             # D
-            all_real_img += [(D_img.detach().clone().to(device).to(torch.float32) / 127.5 - 1).split(d_batch_gpu)]
+            all_real_img += [D_img.detach().clone().split(d_batch_gpu)]
             all_real_c += [D_img_c.detach().clone().to(device).split(d_batch_gpu)]
             all_gen_z += [D_z.detach().clone().split(d_batch_gpu)]
             
             # G
-            all_real_img += [(G_img.detach().clone().to(device).to(torch.float32) / 127.5 - 1).split(g_batch_gpu)]
+            all_real_img += [G_img.detach().clone().split(g_batch_gpu)]
             all_real_c += [G_img_c.detach().clone().to(device).split(g_batch_gpu)]
             all_gen_z += [G_z.detach().clone().split(g_batch_gpu)]
-            
+        
         cur_lr = cosine_decay_with_warmup(cur_nimg, **lr_scheduler)
         cur_beta2 = cosine_decay_with_warmup(cur_nimg, **beta2_scheduler)
         cur_gamma = cosine_decay_with_warmup(cur_nimg, **gamma_scheduler)
@@ -396,8 +415,8 @@ def training_loop(
 
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            images = torch.cat([G_ema(z, c).cpu() for z, c in zip(grid_z, grid_c)]).to(torch.float).numpy()
-            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:09d}.png'), drange=[-1,1], grid_size=grid_size)
+            images = torch.cat([encoder.decode(G_ema(z, c)).cpu() for z, c in zip(grid_z, grid_c)]).to(torch.float).numpy()
+            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:09d}.png'), grid_size=grid_size)
 
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
             for real_img, real_c, gen_z in zip(phase_real_img, phase_real_c, phase_gen_z):
@@ -413,7 +432,7 @@ def training_loop(
         snapshot_pkl = None
         snapshot_data = None
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
-            snapshot_data = dict(G=G, D=D, G_ema=G_ema, training_set_kwargs=dict(training_set_kwargs), cur_nimg=cur_nimg)
+            snapshot_data = dict(G=G, D=D, G_ema=G_ema, training_set_kwargs=dict(training_set_kwargs), eval_set_kwargs=dict(eval_set_kwargs), encoder_kwargs=dict(encoder_kwargs), cur_nimg=cur_nimg)
             for phase in phases:
                 snapshot_data[phase.name + '_opt_state'] = remap_optimizer_state_dict(phase.opt.state_dict(), 'cpu')
             for key, value in snapshot_data.items():
@@ -435,8 +454,8 @@ def training_loop(
             if rank == 0:
                 print('Evaluating metrics...')
             for metric in metrics:
-                result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
-                    dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
+                result_dict = metric_main.calc_metric(metric=metric, G=ema_preview, encoder_kwargs=encoder_kwargs,
+                    dataset_kwargs=eval_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
                 if rank == 0:
                     metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
                 stats_metrics.update(result_dict.results)

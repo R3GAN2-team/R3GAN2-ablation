@@ -123,6 +123,7 @@ def parse_comma_separated_list(s):
 # Required.
 @click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
 @click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
+@click.option('--eval',         help='Evaluation data', metavar='[ZIP|DIR]',                    type=str, default='none', show_default=True)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
 @click.option('--preset',       help='Preset configs', metavar='STR',                           type=str, required=True)
@@ -168,6 +169,10 @@ def main(**kwargs):
         raise click.ClickException('--cond=True requires labels specified in dataset.json')
     c.training_set_kwargs.use_labels = opts.cond
     c.training_set_kwargs.xflip = opts.mirror
+
+    if opts.eval == 'none':
+        opts.eval = opts.data
+    c.eval_set_kwargs, _ = init_dataset_kwargs(data=opts.eval)
 
     # Hyperparameters & settings.
     c.num_gpus = opts.gpus

@@ -63,7 +63,7 @@ def subprocess_fn(rank, args, temp_dir):
         if rank == 0 and args.verbose:
             print(f'Calculating {metric}...')
         progress = metric_utils.ProgressMonitor(verbose=args.verbose)
-        result_dict = metric_main.calc_metric(metric=metric, G=G, dataset_kwargs=args.dataset_kwargs,
+        result_dict = metric_main.calc_metric(metric=metric, G=G, encoder_kwargs=args.encoder_kwargs, dataset_kwargs=args.dataset_kwargs,
             num_gpus=args.num_gpus, rank=rank, device=device, progress=progress)
         if rank == 0:
             metric_main.report_metric(result_dict, run_dir=args.run_dir, snapshot_pkl=args.network_pkl)
@@ -140,11 +140,13 @@ def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose):
         network_dict = legacy.load_network_pkl(f)
         args.G = network_dict['G_ema'] # subclass of torch.nn.Module
 
+    args.encoder_kwargs = dnnlib.EasyDict(network_dict['encoder_kwargs'])
+
     # Initialize dataset options.
     if data is not None:
         args.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data)
-    elif network_dict['training_set_kwargs'] is not None:
-        args.dataset_kwargs = dnnlib.EasyDict(network_dict['training_set_kwargs'])
+    elif network_dict['eval_set_kwargs'] is not None:
+        args.dataset_kwargs = dnnlib.EasyDict(network_dict['eval_set_kwargs'])
     else:
         ctx.fail('Could not look up dataset options; please specify --data')
 

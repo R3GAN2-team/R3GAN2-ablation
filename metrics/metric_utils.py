@@ -21,10 +21,11 @@ import dnnlib
 #----------------------------------------------------------------------------
 
 class MetricOptions:
-    def __init__(self, G=None, G_kwargs={}, dataset_kwargs={}, num_gpus=1, rank=0, device=None, progress=None, cache=True):
+    def __init__(self, G=None, G_kwargs={}, encoder_kwargs={}, dataset_kwargs={}, num_gpus=1, rank=0, device=None, progress=None, cache=True):
         assert 0 <= rank < num_gpus
         self.G              = G
         self.G_kwargs       = dnnlib.EasyDict(G_kwargs)
+        self.encoder_kwargs = dnnlib.EasyDict(encoder_kwargs)      
         self.dataset_kwargs = dnnlib.EasyDict(dataset_kwargs)
         self.num_gpus       = num_gpus
         self.rank           = rank
@@ -253,6 +254,7 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
     # Setup generator and labels.
     G = copy.deepcopy(opts.G).eval().requires_grad_(False).to(opts.device)
     c_iter = iterate_random_labels(opts=opts, batch_size=batch_gen)
+    encoder = dnnlib.util.construct_class_by_name(**opts.encoder_kwargs)
 
     # Initialize.
     stats = FeatureStats(**stats_kwargs)
@@ -265,8 +267,7 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
         images = []
         for _i in range(batch_size // batch_gen):
             z = torch.randn([batch_gen, G.z_dim], device=opts.device)
-            img = G(z, next(c_iter))
-            img = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+            img = encoder.decode(G(z, next(c_iter)))
             images.append(img)
         images = torch.cat(images)
         if images.shape[1] == 1:

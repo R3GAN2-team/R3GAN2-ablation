@@ -116,14 +116,14 @@ def BuildResidualGroups(WidthPerStage, BlocksPerStage, CardinalityPerStage, Expa
     return ResidualGroups
     
 class Generator(nn.Module):
-    def __init__(self, NoiseDimension, WidthPerStage, CardinalityPerStage, BlocksPerStage, ExpansionFactor, ConditionDimension=None, ConditionEmbeddingDimension=0, KernelSize=3, ResamplingFilter=[1, 2, 1]):
+    def __init__(self, NoiseDimension, OutputChannels, WidthPerStage, CardinalityPerStage, BlocksPerStage, ExpansionFactor, ConditionDimension=None, ConditionEmbeddingDimension=0, KernelSize=3, ResamplingFilter=[1, 2, 1]):
         super(Generator, self).__init__()
         
         self.MainLayers = nn.ModuleList(BuildResidualGroups(WidthPerStage, BlocksPerStage, CardinalityPerStage, ExpansionFactor, KernelSize, sum(BlocksPerStage)))
         self.TransitionLayers = nn.ModuleList([UpsampleLayer(WidthPerStage[x], WidthPerStage[x + 1], ResamplingFilter) for x in range(len(WidthPerStage) - 1)])
 
         self.Head = GenerativeBasis(NoiseDimension + ConditionEmbeddingDimension, WidthPerStage[0])
-        self.AggregationLayer = Convolution(WidthPerStage[-1], 3, KernelSize=1)
+        self.AggregationLayer = Convolution(WidthPerStage[-1], OutputChannels, KernelSize=1)
         
         if ConditionDimension is not None:
             self.EmbeddingLayer = MSRInitializer(nn.Linear(ConditionDimension, ConditionEmbeddingDimension, bias=False))
@@ -140,14 +140,14 @@ class Generator(nn.Module):
         return self.AggregationLayer(x)
 
 class Discriminator(nn.Module):
-    def __init__(self, WidthPerStage, CardinalityPerStage, BlocksPerStage, ExpansionFactor, ConditionDimension=None, ConditionEmbeddingDimension=0, KernelSize=3, ResamplingFilter=[1, 2, 1]):
+    def __init__(self, InputChannels, WidthPerStage, CardinalityPerStage, BlocksPerStage, ExpansionFactor, ConditionDimension=None, ConditionEmbeddingDimension=0, KernelSize=3, ResamplingFilter=[1, 2, 1]):
         super(Discriminator, self).__init__()
         
         self.MainLayers = nn.ModuleList(BuildResidualGroups(WidthPerStage, BlocksPerStage, CardinalityPerStage, ExpansionFactor, KernelSize, sum(BlocksPerStage)))
         self.TransitionLayers = nn.ModuleList([DownsampleLayer(WidthPerStage[x], WidthPerStage[x + 1], ResamplingFilter) for x in range(len(WidthPerStage) - 1)])
 
         self.Head = DiscriminativeBasis(WidthPerStage[-1], 1 if ConditionDimension is None else ConditionEmbeddingDimension)
-        self.ExtractionLayer = Convolution(3, WidthPerStage[0], KernelSize=1)
+        self.ExtractionLayer = Convolution(InputChannels, WidthPerStage[0], KernelSize=1)
         
         if ConditionDimension is not None:
             self.EmbeddingLayer = MSRInitializer(nn.Linear(ConditionDimension, ConditionEmbeddingDimension, bias=False), ActivationGain=1 / math.sqrt(ConditionEmbeddingDimension))
