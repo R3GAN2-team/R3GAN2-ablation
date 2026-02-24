@@ -25,6 +25,7 @@ from torch_utils.ops import grid_sample_gradfix
 
 import legacy
 from metrics import metric_main
+from .feat_collector import CollectGeneratorFeatures, CollectDiscriminatorFeatures, CollectMagnitude
 
 def cosine_decay_with_warmup(cur_nimg, base_value, total_nimg, final_value=0.0, warmup_value=0.0, warmup_nimg=0, hold_base_value_nimg=0):
     decay = 0.5 * (1 + np.cos(np.pi * (cur_nimg - warmup_nimg - hold_base_value_nimg) / float(total_nimg - warmup_nimg - hold_base_value_nimg)))
@@ -398,6 +399,16 @@ def training_loop(
             images = torch.cat([G_ema(z, c).cpu() for z, c in zip(grid_z, grid_c)]).to(torch.float).numpy()
             save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:09d}.png'), drange=[-1,1], grid_size=grid_size)
 
+        if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
+            for real_img, real_c, gen_z in zip(phase_real_img, phase_real_c, phase_gen_z):
+                with torch.no_grad():
+                    for x in CollectGeneratorFeatures(G.Model, gen_z, real_c):
+                        training_stats.report('MagnitudeG/avg/' + str(x.shape[2]), CollectMagnitude(x, 'avg'))
+                        training_stats.report('MagnitudeG/max/' + str(x.shape[2]), CollectMagnitude(x, 'max'))
+                    for x in CollectDiscriminatorFeatures(D.Model, real_img, real_c):
+                        training_stats.report('MagnitudeD/avg/' + str(x.shape[2]), CollectMagnitude(x, 'avg'))
+                        training_stats.report('MagnitudeD/max/' + str(x.shape[2]), CollectMagnitude(x, 'max'))
+        
         # Save network snapshot.
         snapshot_pkl = None
         snapshot_data = None
