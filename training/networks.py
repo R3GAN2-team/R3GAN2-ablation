@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 import copy
 import R3GAN.Networks
@@ -13,8 +12,8 @@ class Generator(nn.Module):
         del config['img_channels']
         
         if kw['c_dim'] != 0:
-            config['ConditionDimension'] = kw['c_dim']
-
+            config['NumberOfClasses'] = kw['c_dim']
+        
         config['OutputChannels'] = kw['img_channels']
         
         self.Model = R3GAN.Networks.Generator(*args, **config)
@@ -35,8 +34,8 @@ class Discriminator(nn.Module):
         del config['img_channels']
         
         if kw['c_dim'] != 0:
-            config['ConditionDimension'] = kw['c_dim']
-
+            config['NumberOfClasses'] = kw['c_dim']
+            
         config['InputChannels'] = kw['img_channels']
         
         self.Model = R3GAN.Networks.Discriminator(*args, **config)

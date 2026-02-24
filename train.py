@@ -184,14 +184,12 @@ def main(**kwargs):
     if opts.preset == 'CIFAR10':
         WidthPerStage = [3 * x // 4 for x in [1024, 1024, 1024, 1024]]
         BlocksPerStage = [2 * x for x in [1, 1, 1, 1]]
-        CardinalityPerStage = [3 * x for x in [32, 32, 32, 32]]
         NoiseDimension = 64
         aug_config = dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=0.5, contrast=0.5, lumaflip=0.5, hue=0.5, saturation=0.5, cutout=1)
         ema_stds = [0.010, 0.050, 0.100]
 
-        if opts.cond:
-            c.G_kwargs.ConditionEmbeddingDimension = NoiseDimension
-            c.D_kwargs.ConditionEmbeddingDimension = WidthPerStage[0]
+        c.G_kwargs.ClassEmbeddingDimension = NoiseDimension
+        c.D_kwargs.ClassEmbeddingDimension = WidthPerStage[0]
        
         decay_nimg = 2e7
        
@@ -203,13 +201,12 @@ def main(**kwargs):
     if opts.preset == 'ImageNet-Ablation':
         WidthPerStage = [3 * x // 4 for x in [1024, 1024, 1024, 1024]]
         BlocksPerStage = [2 * x for x in [1, 1, 1, 1]]
-        CardinalityPerStage = [3 * x for x in [32, 32, 32, 32]]
         NoiseDimension = 64
         aug_config = dict(rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, cutout=1)
         ema_stds = [0.050, 0.100, 0.200, 0.300]
        
-        c.G_kwargs.ConditionEmbeddingDimension = NoiseDimension
-        c.D_kwargs.ConditionEmbeddingDimension = WidthPerStage[0]
+        c.G_kwargs.ClassEmbeddingDimension = NoiseDimension
+        c.D_kwargs.ClassEmbeddingDimension = WidthPerStage[0]
        
         decay_nimg = 2e8 / 2
        
@@ -220,14 +217,14 @@ def main(**kwargs):
 
     c.G_kwargs.NoiseDimension = NoiseDimension
     c.G_kwargs.WidthPerStage = WidthPerStage
-    c.G_kwargs.CardinalityPerStage = CardinalityPerStage
     c.G_kwargs.BlocksPerStage = BlocksPerStage
-    c.G_kwargs.ExpansionFactor = 2
+    c.G_kwargs.FFNWidthRatio = 2
+    c.G_kwargs.ChannelsPerConvolutionGroup = 32
     
     c.D_kwargs.WidthPerStage = [*reversed(WidthPerStage)]
-    c.D_kwargs.CardinalityPerStage = [*reversed(CardinalityPerStage)]
     c.D_kwargs.BlocksPerStage = [*reversed(BlocksPerStage)]
-    c.D_kwargs.ExpansionFactor = 2
+    c.D_kwargs.FFNWidthRatio = 2
+    c.D_kwargs.ChannelsPerConvolutionGroup = 32
     
     
     c.metrics = opts.metrics

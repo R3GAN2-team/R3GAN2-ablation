@@ -23,19 +23,18 @@ class Convolution(nn.Module):
         return nn.functional.conv2d(x, self.Layer.weight.to(x.dtype), padding=self.Layer.padding, groups=self.Layer.groups)
 
 class ResidualBlock(nn.Module):
-    def __init__(self, InputChannels, Cardinality, ExpansionFactor, KernelSize, VarianceScalingParameter):
+    def __init__(self, InputChannels, HiddenChannels, ChannelsPerGroup, KernelSize, VarianceScalingParameter):
         super(ResidualBlock, self).__init__()
         
         NumberOfLinearLayers = 3
-        ExpandedChannels = InputChannels * ExpansionFactor
         ActivationGain = BiasedActivation.Gain * VarianceScalingParameter ** (-1 / (2 * NumberOfLinearLayers - 2))
         
-        self.LinearLayer1 = Convolution(InputChannels, ExpandedChannels, KernelSize=1, ActivationGain=ActivationGain)
-        self.LinearLayer2 = Convolution(ExpandedChannels, ExpandedChannels, KernelSize=KernelSize, Groups=Cardinality, ActivationGain=ActivationGain)
-        self.LinearLayer3 = Convolution(ExpandedChannels, InputChannels, KernelSize=1, ActivationGain=0)
+        self.LinearLayer1 = Convolution(InputChannels, HiddenChannels, KernelSize=1, ActivationGain=ActivationGain)
+        self.LinearLayer2 = Convolution(HiddenChannels, HiddenChannels, KernelSize=KernelSize, Groups=HiddenChannels // ChannelsPerGroup, ActivationGain=ActivationGain)
+        self.LinearLayer3 = Convolution(HiddenChannels, InputChannels, KernelSize=1, ActivationGain=0)
         
-        self.NonLinearity1 = BiasedActivation(ExpandedChannels)
-        self.NonLinearity2 = BiasedActivation(ExpandedChannels)
+        self.NonLinearity1 = BiasedActivation(HiddenChannels)
+        self.NonLinearity2 = BiasedActivation(HiddenChannels)
         
     def forward(self, x):
         y = self.LinearLayer1(x)
@@ -106,27 +105,27 @@ class DiscriminativeBasis(nn.Module):
     def forward(self, x):
         return self.LinearLayer(self.Basis(x).view(x.shape[0], -1))
     
-def BuildResidualGroups(WidthPerStage, BlocksPerStage, CardinalityPerStage, ExpansionFactor, KernelSize, VarianceScalingParameter):
+def BuildResidualGroups(WidthPerStage, BlocksPerStage, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize, VarianceScalingParameter):
     ResidualGroups = []
-    for Width, NumberOfBlocks, Cardinality in zip(WidthPerStage, BlocksPerStage, CardinalityPerStage):
+    for Width, NumberOfBlocks in zip(WidthPerStage, BlocksPerStage):
         BlockConstructors = []
         for _ in range(NumberOfBlocks):
-            BlockConstructors += [(ResidualBlock, dict(InputChannels=Width, Cardinality=Cardinality, ExpansionFactor=ExpansionFactor, KernelSize=KernelSize, VarianceScalingParameter=VarianceScalingParameter))]
+            BlockConstructors += [(ResidualBlock, dict(InputChannels=Width, HiddenChannels=round(Width * FFNWidthRatio), ChannelsPerGroup=ChannelsPerConvolutionGroup, KernelSize=KernelSize, VarianceScalingParameter=VarianceScalingParameter))]
         ResidualGroups += [ResidualGroup(Width, BlockConstructors)]
     return ResidualGroups
     
 class Generator(nn.Module):
-    def __init__(self, NoiseDimension, OutputChannels, WidthPerStage, CardinalityPerStage, BlocksPerStage, ExpansionFactor, ConditionDimension=None, ConditionEmbeddingDimension=0, KernelSize=3, ResamplingFilter=[1, 2, 1]):
+    def __init__(self, NoiseDimension, OutputChannels, WidthPerStage, BlocksPerStage, FFNWidthRatio, ChannelsPerConvolutionGroup, NumberOfClasses=None, ClassEmbeddingDimension=0, KernelSize=3, ResamplingFilter=[1, 2, 1]):
         super(Generator, self).__init__()
         
-        self.MainLayers = nn.ModuleList(BuildResidualGroups(WidthPerStage, BlocksPerStage, CardinalityPerStage, ExpansionFactor, KernelSize, sum(BlocksPerStage)))
+        self.MainLayers = nn.ModuleList(BuildResidualGroups(WidthPerStage, BlocksPerStage, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize, sum(BlocksPerStage)))
         self.TransitionLayers = nn.ModuleList([UpsampleLayer(WidthPerStage[x], WidthPerStage[x + 1], ResamplingFilter) for x in range(len(WidthPerStage) - 1)])
 
-        self.Head = GenerativeBasis(NoiseDimension + ConditionEmbeddingDimension, WidthPerStage[0])
+        self.Head = GenerativeBasis(NoiseDimension + ClassEmbeddingDimension, WidthPerStage[0])
         self.AggregationLayer = Convolution(WidthPerStage[-1], OutputChannels, KernelSize=1)
         
-        if ConditionDimension is not None:
-            self.EmbeddingLayer = MSRInitializer(nn.Linear(ConditionDimension, ConditionEmbeddingDimension, bias=False))
+        if NumberOfClasses is not None:
+            self.EmbeddingLayer = MSRInitializer(nn.Linear(NumberOfClasses, ClassEmbeddingDimension, bias=False))
         
     def forward(self, x, y=None):
         x = torch.cat([x, self.EmbeddingLayer(y)], dim=1) if hasattr(self, 'EmbeddingLayer') else x
@@ -140,17 +139,17 @@ class Generator(nn.Module):
         return self.AggregationLayer(x)
 
 class Discriminator(nn.Module):
-    def __init__(self, InputChannels, WidthPerStage, CardinalityPerStage, BlocksPerStage, ExpansionFactor, ConditionDimension=None, ConditionEmbeddingDimension=0, KernelSize=3, ResamplingFilter=[1, 2, 1]):
+    def __init__(self, InputChannels, WidthPerStage, BlocksPerStage, FFNWidthRatio, ChannelsPerConvolutionGroup, NumberOfClasses=None, ClassEmbeddingDimension=0, KernelSize=3, ResamplingFilter=[1, 2, 1]):
         super(Discriminator, self).__init__()
         
-        self.MainLayers = nn.ModuleList(BuildResidualGroups(WidthPerStage, BlocksPerStage, CardinalityPerStage, ExpansionFactor, KernelSize, sum(BlocksPerStage)))
+        self.MainLayers = nn.ModuleList(BuildResidualGroups(WidthPerStage, BlocksPerStage, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize, sum(BlocksPerStage)))
         self.TransitionLayers = nn.ModuleList([DownsampleLayer(WidthPerStage[x], WidthPerStage[x + 1], ResamplingFilter) for x in range(len(WidthPerStage) - 1)])
 
-        self.Head = DiscriminativeBasis(WidthPerStage[-1], 1 if ConditionDimension is None else ConditionEmbeddingDimension)
+        self.Head = DiscriminativeBasis(WidthPerStage[-1], 1 if NumberOfClasses is None else ClassEmbeddingDimension)
         self.ExtractionLayer = Convolution(InputChannels, WidthPerStage[0], KernelSize=1)
         
-        if ConditionDimension is not None:
-            self.EmbeddingLayer = MSRInitializer(nn.Linear(ConditionDimension, ConditionEmbeddingDimension, bias=False), ActivationGain=1 / math.sqrt(ConditionEmbeddingDimension))
+        if NumberOfClasses is not None:
+            self.EmbeddingLayer = MSRInitializer(nn.Linear(NumberOfClasses, ClassEmbeddingDimension, bias=False), ActivationGain=1 / math.sqrt(ClassEmbeddingDimension))
         
     def forward(self, x, y=None):
         x = self.ExtractionLayer(x.to(torch.bfloat16))
