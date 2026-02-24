@@ -58,14 +58,12 @@ class ResidualGroup(nn.Module):
 class UpsampleLayer(nn.Module):
     def __init__(self, InputChannels, OutputChannels, ResamplingFilter):
         super(UpsampleLayer, self).__init__()
+
+        assert InputChannels == OutputChannels, "The current partial impl is only correct when InputChannels == OutputChannels"
         
         self.Resampler = InterpolativeUpsampler(ResamplingFilter)
         
-        if InputChannels != OutputChannels:
-            self.LinearLayer = Convolution(InputChannels, OutputChannels, KernelSize=1)
-        
     def forward(self, x):
-        x = self.LinearLayer(x) if hasattr(self, 'LinearLayer') else x
         x = self.Resampler(x)
         
         return x
@@ -73,15 +71,13 @@ class UpsampleLayer(nn.Module):
 class DownsampleLayer(nn.Module):
     def __init__(self, InputChannels, OutputChannels, ResamplingFilter):
         super(DownsampleLayer, self).__init__()
+
+        assert InputChannels == OutputChannels, "The current partial impl is only correct when InputChannels == OutputChannels"
         
         self.Resampler = InterpolativeDownsampler(ResamplingFilter)
         
-        if InputChannels != OutputChannels:
-            self.LinearLayer = Convolution(InputChannels, OutputChannels, KernelSize=1)
-        
     def forward(self, x):
         x = self.Resampler(x)
-        x = self.LinearLayer(x) if hasattr(self, 'LinearLayer') else x
         
         return x
     
