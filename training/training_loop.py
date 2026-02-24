@@ -127,6 +127,7 @@ def training_loop(
     D_opt_kwargs            = {},       # Options for discriminator optimizer.
     lr_scheduler            = None,
     beta2_scheduler         = None,
+    ema_kwargs              = None,
     augment_kwargs          = None,     # Options for augmentation pipeline. None = disable.
     loss_kwargs             = {},       # Options for loss function.
     gamma_scheduler         = None,
@@ -137,12 +138,12 @@ def training_loop(
     batch_size              = 4,        # Total batch size for one training iteration. Can be larger than batch_gpu * num_gpus.
     g_batch_gpu             = 4,        # Number of samples processed at a time by one GPU.
     d_batch_gpu             = 4,        # Number of samples processed at a time by one GPU.
-    ema_scheduler           = None,
     aug_scheduler           = None,
     total_kimg              = 25000,    # Total length of the training, measured in thousands of real images.
     kimg_per_tick           = 4,        # Progress snapshot interval.
     image_snapshot_ticks    = 50,       # How often to save image snapshots? None = disable.
     network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
+    ema_snapshot_ticks      = 50,
     resume_pkl              = None,     # Network pickle to resume training from.
     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
@@ -158,6 +159,10 @@ def training_loop(
     torch.backends.cudnn.allow_tf32 = False             # Improves numerical accuracy.
     conv2d_gradfix.enabled = True                       # Improves training speed.
     grid_sample_gradfix.enabled = True                  # Avoids errors with the augmentation pipe.
+
+    if rank == 0:
+        os.mkdir(os.path.join(run_dir, 'ema'))
+        os.mkdir(os.path.join(run_dir, 'snapshots'))
 
     # Load training set.
     if rank == 0:
@@ -194,7 +199,8 @@ def training_loop(
     common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=training_set.resolution, img_channels=ref_image.shape[1])
     G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
-    G_ema = copy.deepcopy(G).eval()
+    ema = dnnlib.util.construct_class_by_name(net=G, **ema_kwargs)
+    ema_preview = ema.emas[1]
 
     # Resume from existing pickle.
     if resume_pkl is not None:
@@ -202,8 +208,9 @@ def training_loop(
             resume_data = legacy.load_network_pkl(f)
         if rank == 0:
             print(f'Resuming from "{resume_pkl}"')
-            for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
+            for name, module in [('G', G), ('D', D)]:
                 misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
+            ema.load_state_dict(resume_data)
 
     # Print network summary tables.
     if rank == 0:
@@ -223,7 +230,7 @@ def training_loop(
     # Distribute across GPUs.
     if rank == 0:
         print(f'Distributing across {num_gpus} GPUs...')
-    for module in [G, D, G_ema]:
+    for module in [G, D, ema.net, *ema.emas]:
         if module is not None and num_gpus > 1:
             for param in misc.params_and_buffers(module):
                 torch.distributed.broadcast(param, src=0)
@@ -261,7 +268,7 @@ def training_loop(
         save_image_grid(images, os.path.join(run_dir, 'reals.png'), grid_size=grid_size)
         grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(g_batch_gpu)
         grid_c = torch.from_numpy(labels).to(device).split(g_batch_gpu)
-        images = torch.cat([encoder.decode(G_ema(z, c)).cpu() for z, c in zip(grid_z, grid_c)]).to(torch.float).numpy()
+        images = torch.cat([encoder.decode(ema_preview(z, c)).cpu() for z, c in zip(grid_z, grid_c)]).to(torch.float).numpy()
         save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), grid_size=grid_size)
 
     # Initialize logs.
@@ -327,7 +334,6 @@ def training_loop(
         cur_lr = cosine_decay_with_warmup(cur_nimg, **lr_scheduler)
         cur_beta2 = cosine_decay_with_warmup(cur_nimg, **beta2_scheduler)
         cur_gamma = cosine_decay_with_warmup(cur_nimg, **gamma_scheduler)
-        cur_ema_nimg = cosine_decay_with_warmup(cur_nimg, **ema_scheduler)
         cur_aug_p = cosine_decay_with_warmup(cur_nimg, **aug_scheduler)
         
         if augment_pipe is not None:
@@ -366,18 +372,13 @@ def training_loop(
             if phase.end_event is not None:
                 phase.end_event.record(torch.cuda.current_stream(device))
 
-        # Update G_ema.
-        with torch.autograd.profiler.record_function('Gema'):
-            ema_beta = 0.5 ** (batch_size / max(cur_ema_nimg, 1e-8))
-            for p_ema, p in zip(G_ema.parameters(), G.parameters()):
-                p_ema.copy_(p.lerp(p_ema, ema_beta))
-            for b_ema, b in zip(G_ema.buffers(), G.buffers()):
-                b_ema.copy_(b)
-
         # Update state.
         cur_nimg += batch_size
         batch_idx += 1
 
+        # Update EMA
+        ema.update(cur_nimg=cur_nimg, batch_size=batch_size)
+        
         # Perform maintenance tasks once per tick.
         done = (cur_nimg >= total_kimg * 1000)
         if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
@@ -398,7 +399,6 @@ def training_loop(
         torch.cuda.reset_peak_memory_stats()
         fields += [f"augment {training_stats.report0('Progress/augment', float(augment_pipe.p.cpu()) if augment_pipe is not None else 0):.3f}"]
         training_stats.report0('Progress/lr', cur_lr)
-        training_stats.report0('Progress/ema_mimg', cur_ema_nimg / 1e6)
         training_stats.report0('Progress/beta2', cur_beta2)
         training_stats.report0('Progress/gamma', cur_gamma)
         training_stats.report0('Timing/total_hours', (tick_end_time - start_time) / (60 * 60))
@@ -415,7 +415,7 @@ def training_loop(
 
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            images = torch.cat([encoder.decode(G_ema(z, c)).cpu() for z, c in zip(grid_z, grid_c)]).to(torch.float).numpy()
+            images = torch.cat([encoder.decode(ema_preview(z, c)).cpu() for z, c in zip(grid_z, grid_c)]).to(torch.float).numpy()
             save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:09d}.png'), grid_size=grid_size)
 
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
@@ -428,11 +428,25 @@ def training_loop(
                         training_stats.report('MagnitudeD/avg/' + str(x.shape[2]), CollectMagnitude(x, 'avg'))
                         training_stats.report('MagnitudeD/max/' + str(x.shape[2]), CollectMagnitude(x, 'max'))
         
+        if (ema_snapshot_ticks is not None) and (done or cur_tick % ema_snapshot_ticks == 0):
+            ema_list = ema.get()
+            ema_list = ema_list if isinstance(ema_list, list) else [(ema_list, '')]
+            for ema_net, ema_suffix in ema_list:
+                data = dnnlib.EasyDict(training_set_kwargs=dict(training_set_kwargs), eval_set_kwargs=dict(eval_set_kwargs), encoder_kwargs=dict(encoder_kwargs))
+                data.ema = copy.deepcopy(ema_net).cpu().eval().requires_grad_(False)
+                fname = f'ema-snapshot-{cur_nimg//1000:09d}{ema_suffix}.pkl'
+                if rank == 0:
+                    print(f'Saving {fname} ... ', end='', flush=True)
+                    with open(os.path.join(run_dir, 'ema', fname), 'wb') as f:
+                        pickle.dump(data, f)
+                    print('done')
+                del data # conserve memory
+        
         # Save network snapshot.
         snapshot_pkl = None
         snapshot_data = None
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
-            snapshot_data = dict(G=G, D=D, G_ema=G_ema, training_set_kwargs=dict(training_set_kwargs), eval_set_kwargs=dict(eval_set_kwargs), encoder_kwargs=dict(encoder_kwargs), cur_nimg=cur_nimg)
+            snapshot_data = dict(G=G, D=D, training_set_kwargs=dict(training_set_kwargs), eval_set_kwargs=dict(eval_set_kwargs), encoder_kwargs=dict(encoder_kwargs), cur_nimg=cur_nimg, **ema.state_dict())
             for phase in phases:
                 snapshot_data[phase.name + '_opt_state'] = remap_optimizer_state_dict(phase.opt.state_dict(), 'cpu')
             for key, value in snapshot_data.items():
@@ -444,7 +458,7 @@ def training_loop(
                             torch.distributed.broadcast(param, src=0)
                     snapshot_data[key] = value.cpu()
                 del value # conserve memory
-            snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:09d}.pkl')
+            snapshot_pkl = os.path.join(run_dir, 'snapshots', f'network-snapshot-{cur_nimg//1000:09d}.pkl')
             if rank == 0:
                 with open(snapshot_pkl, 'wb') as f:
                     pickle.dump(snapshot_data, f)
@@ -454,7 +468,7 @@ def training_loop(
             if rank == 0:
                 print('Evaluating metrics...')
             for metric in metrics:
-                result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'], encoder_kwargs=encoder_kwargs,
+                result_dict = metric_main.calc_metric(metric=metric, G=ema_preview, encoder_kwargs=encoder_kwargs,
                     dataset_kwargs=eval_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
                 if rank == 0:
                     metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)

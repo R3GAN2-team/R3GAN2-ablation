@@ -14,6 +14,7 @@ import json
 import tempfile
 import copy
 import torch
+import pickle
 
 import dnnlib
 import legacy
@@ -137,9 +138,9 @@ def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose):
     if args.verbose:
         print(f'Loading network from "{network_pkl}"...')
     with dnnlib.util.open_url(network_pkl, verbose=args.verbose) as f:
-        network_dict = legacy.load_network_pkl(f)
-        args.G = network_dict['G_ema'] # subclass of torch.nn.Module
-
+        network_dict = pickle.load(f)
+        args.G = network_dict['ema'] # subclass of torch.nn.Module
+        
     args.encoder_kwargs = dnnlib.EasyDict(network_dict['encoder_kwargs'])
 
     # Initialize dataset options.

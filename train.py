@@ -144,6 +144,7 @@ def parse_comma_separated_list(s):
 @click.option('--kimg',         help='Total training duration', metavar='KIMG',                 type=click.IntRange(min=1), default=10000000, show_default=True)
 @click.option('--tick',         help='How often to print progress', metavar='KIMG',             type=click.IntRange(min=1), default=4, show_default=True)
 @click.option('--snap',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=50, show_default=True)
+@click.option('--ema-snap',     help='How often to save ema snapshots', metavar='TICKS',        type=click.IntRange(min=1), default=50, show_default=True)
 @click.option('--seed',         help='Random seed', metavar='INT',                              type=click.IntRange(min=0), default=0, show_default=True)
 @click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
@@ -186,15 +187,14 @@ def main(**kwargs):
         CardinalityPerStage = [3 * x for x in [32, 32, 32, 32]]
         NoiseDimension = 64
         aug_config = dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=0.5, contrast=0.5, lumaflip=0.5, hue=0.5, saturation=0.5, cutout=1)
-        
+        ema_stds = [0.010, 0.050, 0.100]
+
         if opts.cond:
             c.G_kwargs.ConditionEmbeddingDimension = NoiseDimension
             c.D_kwargs.ConditionEmbeddingDimension = WidthPerStage[0]
        
-        ema_nimg = 5000 * 1000
         decay_nimg = 2e7
        
-        c.ema_scheduler = { 'base_value': 0, 'final_value': ema_nimg, 'total_nimg': decay_nimg }
         c.aug_scheduler = { 'base_value': 0, 'final_value': 0.55, 'total_nimg': decay_nimg }
         c.lr_scheduler = { 'base_value': 2e-4, 'final_value': 5e-5, 'total_nimg': decay_nimg }
         c.gamma_scheduler = { 'base_value': 0.05, 'final_value': 0.005, 'total_nimg': decay_nimg }
@@ -206,14 +206,13 @@ def main(**kwargs):
         CardinalityPerStage = [3 * x for x in [32, 32, 32, 32]]
         NoiseDimension = 64
         aug_config = dict(rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, cutout=1)
+        ema_stds = [0.050, 0.100, 0.200, 0.300]
        
         c.G_kwargs.ConditionEmbeddingDimension = NoiseDimension
         c.D_kwargs.ConditionEmbeddingDimension = WidthPerStage[0]
        
-        ema_nimg = 50000 * 1000
         decay_nimg = 2e8 / 2
        
-        c.ema_scheduler = { 'base_value': 0, 'final_value': ema_nimg, 'total_nimg': decay_nimg }
         c.aug_scheduler = { 'base_value': 0, 'final_value': 0.3, 'total_nimg': decay_nimg }
         c.lr_scheduler = { 'base_value': 2e-4, 'final_value': 5e-5, 'total_nimg': decay_nimg }
         c.gamma_scheduler = { 'base_value': 0.5, 'final_value': 0.05, 'total_nimg': decay_nimg }
@@ -235,6 +234,7 @@ def main(**kwargs):
     c.total_kimg = opts.kimg
     c.kimg_per_tick = opts.tick
     c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
+    c.ema_snapshot_ticks = opts.ema_snap
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
 
@@ -250,6 +250,8 @@ def main(**kwargs):
     # Augmentation.
     if opts.aug:
         c.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', **aug_config)
+
+    c.ema_kwargs = dnnlib.EasyDict(class_name='training.phema.PowerFunctionEMA', stds=ema_stds)
 
     # Resume.
     if opts.resume is not None:
