@@ -81,25 +81,29 @@ class DownsampleLayer(nn.Module):
         
         return x
     
-class GenerativeBasis(nn.Module):
-    def __init__(self, InputDimension, OutputChannels):
-        super(GenerativeBasis, self).__init__()
+class GenerativeHead(nn.Module):
+    def __init__(self, InputDimension, OutputChannels, ResamplingFilter):
+        super(GenerativeHead, self).__init__()
         
         self.Basis = nn.Parameter(torch.empty(OutputChannels, 4, 4).normal_(0, 1))
         self.LinearLayer = MSRInitializer(nn.Linear(InputDimension, OutputChannels, bias=False))
+        self.Resampler = InterpolativeUpsampler(ResamplingFilter)
         
     def forward(self, x):
-        return self.Basis.view(1, -1, 4, 4) * self.LinearLayer(x).view(x.shape[0], -1, 1, 1)
+        y = self.Basis.view(1, -1, 4, 4) * self.LinearLayer(x).view(x.shape[0], -1, 1, 1)
+
+        return self.Resampler(y)
     
-class DiscriminativeBasis(nn.Module):
-    def __init__(self, InputChannels, OutputDimension):
-        super(DiscriminativeBasis, self).__init__()
+class DiscriminativeHead(nn.Module):
+    def __init__(self, InputChannels, OutputDimension, ResamplingFilter):
+        super(DiscriminativeHead, self).__init__()
         
         self.Basis = MSRInitializer(nn.Conv2d(InputChannels, InputChannels, kernel_size=4, stride=1, padding=0, groups=InputChannels, bias=False))
         self.LinearLayer = MSRInitializer(nn.Linear(InputChannels, OutputDimension, bias=False))
+        self.Resampler = InterpolativeDownsampler(ResamplingFilter)
         
     def forward(self, x):
-        return self.LinearLayer(self.Basis(x).view(x.shape[0], -1))
+        return self.LinearLayer(self.Basis(self.Resampler(x)).view(x.shape[0], -1))
     
 def BuildResidualGroups(WidthPerStage, BlocksPerStage, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize, VarianceScalingParameter):
     ResidualGroups = []
@@ -117,7 +121,7 @@ class Generator(nn.Module):
         self.MainLayers = nn.ModuleList(BuildResidualGroups(WidthPerStage, BlocksPerStage, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize, sum(BlocksPerStage)))
         self.TransitionLayers = nn.ModuleList([UpsampleLayer(WidthPerStage[x], WidthPerStage[x + 1], ResamplingFilter) for x in range(len(WidthPerStage) - 1)])
 
-        self.Head = GenerativeBasis(NoiseDimension + ClassEmbeddingDimension, WidthPerStage[0])
+        self.Head = GenerativeHead(NoiseDimension + ClassEmbeddingDimension, WidthPerStage[0], ResamplingFilter)
         self.AggregationLayer = Convolution(WidthPerStage[-1], OutputChannels, KernelSize=1)
         
         if NumberOfClasses is not None:
@@ -141,7 +145,7 @@ class Discriminator(nn.Module):
         self.MainLayers = nn.ModuleList(BuildResidualGroups(WidthPerStage, BlocksPerStage, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize, sum(BlocksPerStage)))
         self.TransitionLayers = nn.ModuleList([DownsampleLayer(WidthPerStage[x], WidthPerStage[x + 1], ResamplingFilter) for x in range(len(WidthPerStage) - 1)])
 
-        self.Head = DiscriminativeBasis(WidthPerStage[-1], 1 if NumberOfClasses is None else ClassEmbeddingDimension)
+        self.Head = DiscriminativeHead(WidthPerStage[-1], 1 if NumberOfClasses is None else ClassEmbeddingDimension, ResamplingFilter)
         self.ExtractionLayer = Convolution(InputChannels, WidthPerStage[0], KernelSize=1)
         
         if NumberOfClasses is not None:

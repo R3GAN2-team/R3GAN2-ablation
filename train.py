@@ -182,8 +182,8 @@ def main(**kwargs):
     c.d_batch_gpu = opts.d_batch_gpu or opts.batch // opts.gpus
     
     if opts.preset == 'CIFAR10':
-        WidthPerStage = [3 * x // 4 for x in [1024, 1024, 1024, 1024]]
-        BlocksPerStage = [2 * x for x in [1, 1, 1, 1]]
+        WidthPerStage = [3 * x // 4 for x in [1024, 1024, 1024]]
+        BlocksPerStage = [2 * x for x in [1, 1, 1]]
         NoiseDimension = 64
         aug_config = dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=0.5, contrast=0.5, lumaflip=0.5, hue=0.5, saturation=0.5, cutout=1)
         ema_stds = [0.010, 0.050, 0.100]
@@ -199,8 +199,8 @@ def main(**kwargs):
         c.beta2_scheduler = { 'base_value': 0.9, 'final_value': 0.99, 'total_nimg': decay_nimg }
 
     if opts.preset == 'ImageNet-Ablation':
-        WidthPerStage = [3 * x // 4 for x in [1024, 1024, 1024, 1024]]
-        BlocksPerStage = [2 * x for x in [1, 1, 1, 1]]
+        WidthPerStage = [3 * x // 4 for x in [1024, 1024, 1024]]
+        BlocksPerStage = [2 * x for x in [1, 1, 1]]
         NoiseDimension = 64
         aug_config = dict(rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, cutout=1)
         ema_stds = [0.050, 0.100, 0.200, 0.300]
