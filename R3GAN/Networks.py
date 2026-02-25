@@ -4,9 +4,9 @@ import torch.nn as nn
 from .Resamplers import InterpolativeUpsampler, InterpolativeDownsampler
 from .BasicLayers import LeakyReLU, Convolution, Linear, BiasedPointwiseConvolution, BiasedPointwiseConvolutionWithNoiseInjection, GenerativeBasis, DiscriminativeBasis
 
-class ResidualBlock(nn.Module):
+class FeedForwardNetwork(nn.Module):
     def __init__(self, FirstConvolutionType, InputChannels, HiddenChannels, ChannelsPerGroup, KernelSize, VarianceScalingParameter):
-        super(ResidualBlock, self).__init__()
+        super(FeedForwardNetwork, self).__init__()
         
         NumberOfLinearLayers = 3
         ActivationGain = LeakyReLU().Gain * VarianceScalingParameter ** (-1 / (2 * NumberOfLinearLayers - 2))
@@ -85,10 +85,13 @@ class DiscriminativeHead(nn.Module):
     
 def BuildResidualGroups(WidthPerStage, BlocksPerStage, FFNFirstConvolutionType, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize, VarianceScalingParameter):
     ResidualGroups = []
-    for Width, NumberOfBlocks in zip(WidthPerStage, BlocksPerStage):
+    for Width, Blocks in zip(WidthPerStage, BlocksPerStage):
         BlockConstructors = []
-        for _ in range(NumberOfBlocks):
-            BlockConstructors += [(ResidualBlock, dict(FirstConvolutionType=FFNFirstConvolutionType, InputChannels=Width, HiddenChannels=round(Width * FFNWidthRatio), ChannelsPerGroup=ChannelsPerConvolutionGroup, KernelSize=KernelSize, VarianceScalingParameter=VarianceScalingParameter))]
+        for BlockType in Blocks:
+            if BlockType == 'FFN':
+                BlockConstructors += [(FeedForwardNetwork, dict(FirstConvolutionType=FFNFirstConvolutionType, InputChannels=Width, HiddenChannels=round(Width * FFNWidthRatio), ChannelsPerGroup=ChannelsPerConvolutionGroup, KernelSize=KernelSize, VarianceScalingParameter=VarianceScalingParameter))]
+            else:
+                raise NotImplementedError('Unknown block type')
         ResidualGroups += [ResidualGroup(Width, BlockConstructors)]
     return ResidualGroups
     
@@ -96,7 +99,7 @@ class Generator(nn.Module):
     def __init__(self, NoiseDimension, OutputChannels, WidthPerStage, BlocksPerStage, FFNWidthRatio, ChannelsPerConvolutionGroup, NumberOfClasses=None, ClassEmbeddingDimension=0, KernelSize=3, ResamplingFilter=[1, 2, 1]):
         super(Generator, self).__init__()
 
-        self.MainLayers = nn.ModuleList(BuildResidualGroups(WidthPerStage, BlocksPerStage, BiasedPointwiseConvolutionWithNoiseInjection, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize, sum(BlocksPerStage)))
+        self.MainLayers = nn.ModuleList(BuildResidualGroups(WidthPerStage, BlocksPerStage, BiasedPointwiseConvolutionWithNoiseInjection, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize, sum(len(x) for x in BlocksPerStage)))
         self.TransitionLayers = nn.ModuleList([UpsampleLayer(WidthPerStage[x], WidthPerStage[x + 1], ResamplingFilter) for x in range(len(WidthPerStage) - 1)])
 
         self.Head = GenerativeHead(NoiseDimension + ClassEmbeddingDimension, WidthPerStage[0], ResamplingFilter)
@@ -120,7 +123,7 @@ class Discriminator(nn.Module):
     def __init__(self, InputChannels, WidthPerStage, BlocksPerStage, FFNWidthRatio, ChannelsPerConvolutionGroup, NumberOfClasses=None, ClassEmbeddingDimension=0, KernelSize=3, ResamplingFilter=[1, 2, 1]):
         super(Discriminator, self).__init__()
 
-        self.MainLayers = nn.ModuleList(BuildResidualGroups(WidthPerStage, BlocksPerStage, BiasedPointwiseConvolution, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize, sum(BlocksPerStage)))
+        self.MainLayers = nn.ModuleList(BuildResidualGroups(WidthPerStage, BlocksPerStage, BiasedPointwiseConvolution, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize, sum(len(x) for x in BlocksPerStage)))
         self.TransitionLayers = nn.ModuleList([DownsampleLayer(WidthPerStage[x], WidthPerStage[x + 1], ResamplingFilter) for x in range(len(WidthPerStage) - 1)])
 
         self.Head = DiscriminativeHead(WidthPerStage[-1], 1 if NumberOfClasses is None else ClassEmbeddingDimension, ResamplingFilter)
