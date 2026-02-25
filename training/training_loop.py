@@ -40,6 +40,16 @@ def cosine_decay_with_warmup(cur_nimg, base_value, total_nimg, final_value=0.0, 
 
 #----------------------------------------------------------------------------
 
+def edm2_learning_rate_schedule(cur_nimg, batch_size, ref_lr, ref_batches, rampup_Mimg):
+    lr = ref_lr
+    if ref_batches > 0:
+        lr /= np.sqrt(max(cur_nimg / (ref_batches * batch_size), 1))
+    if rampup_Mimg > 0:
+        lr *= min(cur_nimg / (rampup_Mimg * 1e6), 1)
+    return lr
+
+#----------------------------------------------------------------------------
+
 def setup_snapshot_image_grid(training_set, random_seed=0):
     rnd = np.random.RandomState(random_seed)
     gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
@@ -159,7 +169,7 @@ def training_loop(
     torch.backends.cudnn.allow_tf32 = False             # Improves numerical accuracy.
     conv2d_gradfix.enabled = True                       # Improves training speed.
     grid_sample_gradfix.enabled = True                  # Avoids errors with the augmentation pipe.
-
+          
     if rank == 0:
         os.mkdir(os.path.join(run_dir, 'ema'))
         os.mkdir(os.path.join(run_dir, 'snapshots'))
@@ -331,7 +341,7 @@ def training_loop(
             all_real_c += [G_img_c.detach().clone().to(device).split(g_batch_gpu)]
             all_gen_z += [G_z.detach().clone().split(g_batch_gpu)]
         
-        cur_lr = cosine_decay_with_warmup(cur_nimg, **lr_scheduler)
+        cur_lr = edm2_learning_rate_schedule(cur_nimg, **lr_scheduler)
         cur_beta2 = cosine_decay_with_warmup(cur_nimg, **beta2_scheduler)
         cur_gamma = cosine_decay_with_warmup(cur_nimg, **gamma_scheduler)
         cur_aug_p = cosine_decay_with_warmup(cur_nimg, **aug_scheduler)
@@ -367,6 +377,11 @@ def training_loop(
                     for param, grad in zip(params, grads):
                         param.grad = grad.reshape(param.shape)
                 phase.opt.step()
+                
+                # Forced weight norm
+                for x in phase.module.Model.modules():
+                    if hasattr(x, 'NormalizeWeight'):
+                        x.NormalizeWeight()
 
             # Phase done.
             if phase.end_event is not None:

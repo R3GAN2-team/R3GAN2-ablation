@@ -4,13 +4,13 @@ def CollectGeneratorFeatures(Generator, x, y):
     x = torch.cat([x, Generator.EmbeddingLayer(y)], dim=1) if hasattr(Generator, 'EmbeddingLayer') else x
     x = Generator.Head(x).to(torch.bfloat16)
     f = []
-    
+        
     for Layer, Transition in zip(Generator.MainLayers[:-1], Generator.TransitionLayers):
-        x = Layer(x)
-        f += [x]
-        x = Transition(x)
-    x = Generator.MainLayers[-1](x)
-    f += [x]
+        x, AccumulatedVariance = Layer(x)
+        f += [x * torch.rsqrt(AccumulatedVariance).view(1, -1, 1, 1).to(x.dtype)]
+        x = Transition(x, Gain=torch.rsqrt(AccumulatedVariance))
+    x, AccumulatedVariance = Generator.MainLayers[-1](x)
+    f += [x * torch.rsqrt(AccumulatedVariance).view(1, -1, 1, 1).to(x.dtype)]
 
     return f
 
@@ -19,11 +19,11 @@ def CollectDiscriminatorFeatures(Discriminator, x, y):
     f = []
     
     for Layer, Transition in zip(Discriminator.MainLayers[:-1], Discriminator.TransitionLayers):
-        x = Layer(x)
-        f += [x]
-        x = Transition(x)
-    x = Discriminator.MainLayers[-1](x)
-    f += [x]
+        x, AccumulatedVariance = Layer(x)
+        f += [x * torch.rsqrt(AccumulatedVariance).view(1, -1, 1, 1).to(x.dtype)]
+        x = Transition(x, Gain=torch.rsqrt(AccumulatedVariance))
+    x, AccumulatedVariance = Discriminator.MainLayers[-1](x)
+    f += [x * torch.rsqrt(AccumulatedVariance).view(1, -1, 1, 1).to(x.dtype)]
     
     return f
 
