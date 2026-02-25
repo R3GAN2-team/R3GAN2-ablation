@@ -46,6 +46,21 @@ class BiasedPointwiseConvolution(nn.Module):
 
         return nn.functional.conv2d(x, w.to(x.dtype), b.to(x.dtype))
 
+class BiasedPointwiseConvolutionWithNoiseInjection(nn.Module):
+    def __init__(self, InputChannels, OutputChannels, ActivationGain=1):
+        super(BiasedPointwiseConvolutionWithNoiseInjection, self).__init__()
+
+        self.Layer = MSRInitializer(nn.Conv2d(InputChannels + 2, OutputChannels, kernel_size=1, stride=1, padding=0, groups=1, bias=False), ActivationGain=ActivationGain)
+        
+    def forward(self, x):
+        w = self.Layer.weight
+        b = w[:, -1, :, :].view(-1)
+        s = w[:, -2, :, :].view(-1)
+        w = w[:, :-2, :, :]
+        n = torch.randn([x.shape[0], 1, x.shape[2], x.shape[3]], device=x.device)
+
+        return nn.functional.conv2d(x, w.to(x.dtype), b.to(x.dtype)).add_(n * s.view(1, -1, 1, 1))
+
 class GenerativeBasis(nn.Module):
     def __init__(self, OutputChannels):
         super(GenerativeBasis, self).__init__()
