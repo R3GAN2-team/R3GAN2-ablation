@@ -1,45 +1,25 @@
-import math
+﻿import math
 import torch
 import torch.nn as nn
 from .Resamplers import InterpolativeUpsampler, InterpolativeDownsampler
-from .FusedOperators import BiasedActivation
-
-def MSRInitializer(Layer, ActivationGain=1):
-    FanIn = Layer.weight.data.size(1) * Layer.weight.data[0][0].numel()
-    Layer.weight.data.normal_(0,  ActivationGain / math.sqrt(FanIn))
-
-    if Layer.bias is not None:
-        Layer.bias.data.zero_()
-    
-    return Layer
-
-class Convolution(nn.Module):
-    def __init__(self, InputChannels, OutputChannels, KernelSize, Groups=1, ActivationGain=1):
-        super(Convolution, self).__init__()
-        
-        self.Layer = MSRInitializer(nn.Conv2d(InputChannels, OutputChannels, kernel_size=KernelSize, stride=1, padding=(KernelSize - 1) // 2, groups=Groups, bias=False), ActivationGain=ActivationGain)
-        
-    def forward(self, x):
-        return nn.functional.conv2d(x, self.Layer.weight.to(x.dtype), padding=self.Layer.padding, groups=self.Layer.groups)
+from .BasicLayers import LeakyReLU, Convolution, Linear, BiasedPointwiseConvolution, GenerativeBasis, DiscriminativeBasis
 
 class ResidualBlock(nn.Module):
     def __init__(self, InputChannels, HiddenChannels, ChannelsPerGroup, KernelSize, VarianceScalingParameter):
         super(ResidualBlock, self).__init__()
         
         NumberOfLinearLayers = 3
-        ActivationGain = BiasedActivation.Gain * VarianceScalingParameter ** (-1 / (2 * NumberOfLinearLayers - 2))
+        ActivationGain = LeakyReLU().Gain * VarianceScalingParameter ** (-1 / (2 * NumberOfLinearLayers - 2))
         
-        self.LinearLayer1 = Convolution(InputChannels, HiddenChannels, KernelSize=1, ActivationGain=ActivationGain)
+        self.LinearLayer1 = BiasedPointwiseConvolution(InputChannels, HiddenChannels, ActivationGain=ActivationGain)
         self.LinearLayer2 = Convolution(HiddenChannels, HiddenChannels, KernelSize=KernelSize, Groups=HiddenChannels // ChannelsPerGroup, ActivationGain=ActivationGain)
         self.LinearLayer3 = Convolution(HiddenChannels, InputChannels, KernelSize=1, ActivationGain=0)
-        
-        self.NonLinearity1 = BiasedActivation(HiddenChannels)
-        self.NonLinearity2 = BiasedActivation(HiddenChannels)
+        self.NonLinearity = LeakyReLU()
         
     def forward(self, x):
         y = self.LinearLayer1(x)
-        y = self.LinearLayer2(self.NonLinearity1(y))
-        y = self.LinearLayer3(self.NonLinearity2(y))
+        y = self.LinearLayer2(self.NonLinearity(y))
+        y = self.LinearLayer3(self.NonLinearity(y))
         
         return x + y
     
@@ -85,25 +65,23 @@ class GenerativeHead(nn.Module):
     def __init__(self, InputDimension, OutputChannels, ResamplingFilter):
         super(GenerativeHead, self).__init__()
         
-        self.Basis = nn.Parameter(torch.empty(OutputChannels, 4, 4).normal_(0, 1))
-        self.LinearLayer = MSRInitializer(nn.Linear(InputDimension, OutputChannels, bias=False))
+        self.Basis = GenerativeBasis(OutputChannels)
+        self.LinearLayer = Linear(InputDimension, OutputChannels)
         self.Resampler = InterpolativeUpsampler(ResamplingFilter)
         
     def forward(self, x):
-        y = self.Basis.view(1, -1, 4, 4) * self.LinearLayer(x).view(x.shape[0], -1, 1, 1)
-
-        return self.Resampler(y)
+        return self.Resampler(self.Basis(self.LinearLayer(x)))
     
 class DiscriminativeHead(nn.Module):
     def __init__(self, InputChannels, OutputDimension, ResamplingFilter):
         super(DiscriminativeHead, self).__init__()
         
-        self.Basis = MSRInitializer(nn.Conv2d(InputChannels, InputChannels, kernel_size=4, stride=1, padding=0, groups=InputChannels, bias=False))
-        self.LinearLayer = MSRInitializer(nn.Linear(InputChannels, OutputDimension, bias=False))
+        self.Basis = DiscriminativeBasis(InputChannels)
+        self.LinearLayer = Linear(InputChannels, OutputDimension)
         self.Resampler = InterpolativeDownsampler(ResamplingFilter)
         
     def forward(self, x):
-        return self.LinearLayer(self.Basis(self.Resampler(x)).view(x.shape[0], -1))
+        return self.LinearLayer(self.Basis(self.Resampler(x)))
     
 def BuildResidualGroups(WidthPerStage, BlocksPerStage, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize, VarianceScalingParameter):
     ResidualGroups = []
@@ -125,7 +103,7 @@ class Generator(nn.Module):
         self.AggregationLayer = Convolution(WidthPerStage[-1], OutputChannels, KernelSize=1)
         
         if NumberOfClasses is not None:
-            self.EmbeddingLayer = MSRInitializer(nn.Linear(NumberOfClasses, ClassEmbeddingDimension, bias=False))
+            self.EmbeddingLayer = Linear(NumberOfClasses, ClassEmbeddingDimension)
         
     def forward(self, x, y=None):
         x = torch.cat([x, self.EmbeddingLayer(y)], dim=1) if hasattr(self, 'EmbeddingLayer') else x
@@ -149,7 +127,7 @@ class Discriminator(nn.Module):
         self.ExtractionLayer = Convolution(InputChannels, WidthPerStage[0], KernelSize=1)
         
         if NumberOfClasses is not None:
-            self.EmbeddingLayer = MSRInitializer(nn.Linear(NumberOfClasses, ClassEmbeddingDimension, bias=False), ActivationGain=1 / math.sqrt(ClassEmbeddingDimension))
+            self.EmbeddingLayer = Linear(NumberOfClasses, ClassEmbeddingDimension, ActivationGain=1 / math.sqrt(ClassEmbeddingDimension))
         
     def forward(self, x, y=None):
         x = self.ExtractionLayer(x.to(torch.bfloat16))
