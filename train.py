@@ -211,7 +211,7 @@ def main(**kwargs):
         decay_nimg = 2e8 / 2
        
         c.aug_scheduler = { 'base_value': 0, 'final_value': 0.3, 'total_nimg': decay_nimg }
-        c.lr_scheduler = { 'batch_size': 4096, 'ref_lr': 100e-4, 'ref_batches': 70000, 'rampup_Mimg': 10 }
+        c.lr_scheduler = { 'batch_size': 4096, 'ref_lr': 50e-4, 'ref_batches': 70000, 'rampup_Mimg': 10 }
         c.gamma_scheduler = { 'base_value': 5, 'final_value': 0.5, 'total_nimg': decay_nimg }
         c.beta2_scheduler = { 'base_value': 0.9, 'final_value': 0.99, 'total_nimg': decay_nimg }
 
