@@ -17,8 +17,8 @@ class AdversarialTraining:
         RealSamples = RealSamples.detach()
         TransformedFakeSamples, TransformedRealSamples = self.Preprocessor([FakeSamples, RealSamples])
         
-        FakeLogits = self.Discriminator(TransformedFakeSamples, Conditions)
-        RealLogits = self.Discriminator(TransformedRealSamples, Conditions)
+        FakeLogits, _ = self.Discriminator(TransformedFakeSamples, Conditions)
+        RealLogits, _ = self.Discriminator(TransformedRealSamples, Conditions)
         
         RelativisticLogits = FakeLogits - RealLogits
         AdversarialLoss = nn.functional.softplus(-RelativisticLogits)
@@ -32,11 +32,11 @@ class AdversarialTraining:
         FakeSamples = self.Generator(Noise, Conditions).detach().requires_grad_(True)
         TransformedRealSamples, TransformedFakeSamples = self.Preprocessor([RealSamples, FakeSamples])
         
-        RealLogits = self.Discriminator(TransformedRealSamples, Conditions)
-        FakeLogits = self.Discriminator(TransformedFakeSamples, Conditions)
+        RealLogits, UnscaledRealLogits = self.Discriminator(TransformedRealSamples, Conditions)
+        FakeLogits, UnscaledFakeLogits = self.Discriminator(TransformedFakeSamples, Conditions)
         
-        R1Penalty = AdversarialTraining.ZeroCenteredGradientPenalty(RealSamples, RealLogits)
-        R2Penalty = AdversarialTraining.ZeroCenteredGradientPenalty(FakeSamples, FakeLogits)
+        R1Penalty = AdversarialTraining.ZeroCenteredGradientPenalty(RealSamples, UnscaledRealLogits)
+        R2Penalty = AdversarialTraining.ZeroCenteredGradientPenalty(FakeSamples, UnscaledFakeLogits)
         
         RelativisticLogits = RealLogits - FakeLogits
         AdversarialLoss = nn.functional.softplus(-RelativisticLogits)
