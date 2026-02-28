@@ -47,6 +47,8 @@ class R3GANLoss:
             training_stats.report('Loss/D/loss', AdversarialLoss)
             training_stats.report('Loss/r1_penalty', R1Penalty)
             training_stats.report('Loss/r2_penalty', R2Penalty)
+
+            training_stats.report('Progress/discriminator_gain', self.trainer.Discriminator.Model.Gain)
             
             for i, l in enumerate(self.trainer.Discriminator.Model.MainLayers):
                 for j, a in enumerate(l.ParametrizedAlphas):

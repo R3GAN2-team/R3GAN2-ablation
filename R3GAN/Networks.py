@@ -142,6 +142,7 @@ class Discriminator(nn.Module):
         
         self.Head = DiscriminativeHead(WidthPerStage[-1], 1 if NumberOfClasses is None else ClassEmbeddingDimension, round(WidthPerStage[-1] * FFNWidthRatio), ChannelsPerConvolutionGroup, ResamplingFilter)
         self.ExtractionLayer = Convolution(InputChannels, WidthPerStage[0], KernelSize=1)
+        self.Gain = nn.Parameter(torch.ones([]))
         
         if NumberOfClasses is not None:
             self.EmbeddingLayer = ClassEmbedder(NumberOfClasses, ClassEmbeddingDimension)
@@ -159,4 +160,4 @@ class Discriminator(nn.Module):
         x = self.Head(x.to(torch.float32), Gain=torch.rsqrt(AccumulatedVariance))
         x = (x * y / math.sqrt(y.shape[1])).sum(dim=1, keepdim=True) if hasattr(self, 'EmbeddingLayer') else x
         
-        return x.view(x.shape[0])
+        return self.Gain * x.view(x.shape[0])
