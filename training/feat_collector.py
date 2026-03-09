@@ -20,10 +20,10 @@ def CollectDiscriminatorFeatures(Discriminator, x, y):
     
     for Layer, Transition in zip(Discriminator.MainLayers[:-1], Discriminator.TransitionLayers):
         x, AccumulatedVariance = Layer(x)
-        f += [x * torch.rsqrt(AccumulatedVariance).view(1, -1, 1, 1).to(x.dtype)]
-        x = Transition(x, Gain=torch.rsqrt(AccumulatedVariance))
+        f += [x / AccumulatedVariance.view(1, -1, 1, 1).to(x.dtype)]
+        x = Transition(x, Gain=1 / AccumulatedVariance)
     x, AccumulatedVariance = Discriminator.MainLayers[-1](x)
-    f += [x * torch.rsqrt(AccumulatedVariance).view(1, -1, 1, 1).to(x.dtype)]
+    f += [x / AccumulatedVariance.view(1, -1, 1, 1).to(x.dtype)]
     
     return f
 
