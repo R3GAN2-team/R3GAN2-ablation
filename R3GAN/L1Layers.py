@@ -47,9 +47,6 @@ class WeightNormalizedConvolution(nn.Module):
 def Convolution(InputChannels, OutputChannels, KernelSize, Groups=1, Centered=False):
     return WeightNormalizedConvolution(InputChannels, OutputChannels, Groups, True, [KernelSize, KernelSize], Centered)
 
-def Linear(InputDimension, OutputDimension, Centered=False):
-    return WeightNormalizedConvolution(InputDimension, OutputDimension, 1, False, [], Centered)
-
 class BiasedPointwiseConvolution(nn.Module):
     def __init__(self, InputChannels, OutputChannels, Centered=False):
         super(BiasedPointwiseConvolution, self).__init__()
@@ -63,22 +60,3 @@ class BiasedPointwiseConvolution(nn.Module):
         w = w[:, :-1, :, :] * Gain
         
         return nn.functional.conv2d(x, w.to(x.dtype), b.to(x.dtype))
-    
-class DiscriminativeBasis(nn.Module):
-    def __init__(self, InputChannels, ChannelsPerGroup):
-        super(DiscriminativeBasis, self).__init__()
-        
-        self.Basis = WeightNormalizedConvolution(InputChannels, InputChannels, InputChannels // ChannelsPerGroup, False, [4, 4], True)
-        
-    def forward(self, x):
-        return self.Basis(x).view(x.shape[0], -1)
-    
-class ClassEmbedder(nn.Module):
-    def __init__(self, NumberOfClasses, EmbeddingDimension):
-        super(ClassEmbedder, self).__init__()
-        
-        self.Weight = NormalizedWeight(EmbeddingDimension, NumberOfClasses, 1, [], True)
-        self.Weight.Weight.data.copy_(NormalizedWeight(EmbeddingDimension, 1, 1, [], True)().repeat(NumberOfClasses, 1))
-    
-    def forward(self, x):
-        return x @ self.Weight().to(x.dtype)
