@@ -160,4 +160,4 @@ class Discriminator(nn.Module):
         x = self.Head(x.to(torch.float32), Gain=torch.rsqrt(AccumulatedVariance))
         x = (x * y / math.sqrt(y.shape[1])).sum(dim=1, keepdim=True) if hasattr(self, 'EmbeddingLayer') else x
         
-        return self.Gain * x.view(x.shape[0]), x.view(x.shape[0])
+        return self.Gain * x.view(x.shape[0]), self.Gain.detach() * x.view(x.shape[0])
