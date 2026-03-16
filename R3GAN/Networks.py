@@ -3,8 +3,8 @@ import torch
 import torch.nn as nn
 from .Resamplers import InterpolativeUpsampler, InterpolativeDownsampler
 from .MagnitudePreservingLayers import LeakyReLU, Convolution, Linear, BiasedPointwiseConvolution, BiasedPointwiseConvolutionWithNoiseInjection, GenerativeBasis, DiscriminativeBasis, BoundedParameter, ClassEmbedder
-from .L1Layers import Convolution as L1Convolution
-from .L1Layers import BiasedPointwiseConvolution as L1BiasedPointwiseConvolution
+from .SNLayers import Convolution as SNConvolution
+from .SNLayers import BiasedPointwiseConvolution as SNBiasedPointwiseConvolution
 
 class FeedForwardNetwork(nn.Module):
     def __init__(self, FirstConvolutionType, InputChannels, HiddenChannels, ChannelsPerGroup, KernelSize):
@@ -27,8 +27,8 @@ class L1FeedForwardNetwork(nn.Module):
         super(L1FeedForwardNetwork, self).__init__()
         
         self.LinearLayer1 = FirstConvolutionType(InputChannels, HiddenChannels, Centered=True)
-        self.LinearLayer2 = L1Convolution(HiddenChannels, HiddenChannels, KernelSize=KernelSize, Groups=HiddenChannels // ChannelsPerGroup, Centered=True)
-        self.LinearLayer3 = L1Convolution(HiddenChannels, InputChannels, KernelSize=1, Centered=True)
+        self.LinearLayer2 = SNConvolution(HiddenChannels, HiddenChannels, KernelSize=KernelSize, Groups=HiddenChannels // ChannelsPerGroup, Centered=True)
+        self.LinearLayer3 = SNConvolution(HiddenChannels, InputChannels, KernelSize=1, Centered=True)
         self.NonLinearity = LeakyReLU()
         
     def forward(self, x, InputGain, ResidualGain):
@@ -167,7 +167,7 @@ class Discriminator(nn.Module):
     def __init__(self, InputChannels, WidthPerStage, BlocksPerStage, FFNWidthRatio, ChannelsPerConvolutionGroup, NumberOfClasses=None, ClassEmbeddingDimension=0, KernelSize=3, ResamplingFilter=[1, 2, 1]):
         super(Discriminator, self).__init__()
         
-        self.MainLayers = nn.ModuleList(BuildL1ResidualGroups(WidthPerStage, BlocksPerStage, L1BiasedPointwiseConvolution, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize))
+        self.MainLayers = nn.ModuleList(BuildL1ResidualGroups(WidthPerStage, BlocksPerStage, SNBiasedPointwiseConvolution, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize))
         self.TransitionLayers = nn.ModuleList([DownsampleLayer(WidthPerStage[x], WidthPerStage[x + 1], ResamplingFilter) for x in range(len(WidthPerStage) - 1)])
         
         self.Head = DiscriminativeHead(WidthPerStage[-1], 1 if NumberOfClasses is None else ClassEmbeddingDimension, round(WidthPerStage[-1] * FFNWidthRatio), ChannelsPerConvolutionGroup, ResamplingFilter)
