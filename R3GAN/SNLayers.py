@@ -6,7 +6,7 @@ def _l2_normalize(v):
     return v / (v.norm(dim=0, keepdim=True))
 
 @torch.no_grad()
-def power_iteration_sigma(Wmat, u, n_steps=1):
+def power_iteration(Wmat, u, n_steps=1):
     # Ensure float32 for stability.
     W = Wmat.to(torch.float32)
     u_new = u.to(torch.float32)
@@ -15,8 +15,7 @@ def power_iteration_sigma(Wmat, u, n_steps=1):
         v_new = _l2_normalize(W.t() @ u_new)
         u_new = _l2_normalize(W @ v_new)
 
-    sigma = (u_new.t() @ (W @ v_new)).squeeze()  # scalar
-    return sigma, u_new, v_new
+    return u_new, v_new
 
 class SpectralNormalizedWeight(nn.Module):
     def __init__(self, InputChannels, OutputChannels, Groups, KernelSize, Centered, power_iters=10):
@@ -53,11 +52,12 @@ class SpectralNormalizedWeight(nn.Module):
         target_sigma = math.sqrt(fan_in) +  math.sqrt(fan_out)
 
         # Estimate sigma_max(Wmat) via power iteration using stored u.
-        sigma, u_new, _v_new = power_iteration_sigma(Wmat, self.u, n_steps=self.power_iters)
-
+        u_new, v_new = power_iteration(Wmat, self.u, n_steps=self.power_iters)
+        
         if update_u:
             self.u.copy_(u_new.to(self.u.dtype))
 
+        sigma = (u_new.t() @ (Wmat @ v_new)).squeeze()  # scalar
         denom = (sigma / target_sigma)
         w_sn = w / denom
         return w_sn
