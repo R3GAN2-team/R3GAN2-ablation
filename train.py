@@ -211,7 +211,7 @@ def main(**kwargs):
         decay_nimg = 2e8 / 2
        
         c.aug_scheduler = { 'base_value': 0, 'final_value': 0.3, 'total_nimg': decay_nimg }
-        c.lr_scheduler = { 'base_value': 2e-4, 'final_value': 3e-5, 'total_nimg': decay_nimg }
+        c.lr_scheduler = { 'base_value': 2e-4, 'final_value': 5e-5, 'total_nimg': decay_nimg }
         c.gamma_scheduler = { 'base_value': 0.5, 'final_value': 0.05, 'total_nimg': decay_nimg }
         c.beta2_scheduler = { 'base_value': 0.9, 'final_value': 0.9, 'total_nimg': decay_nimg }
 
