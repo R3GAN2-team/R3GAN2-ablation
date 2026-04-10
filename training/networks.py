@@ -40,5 +40,5 @@ class Discriminator(nn.Module):
         
         self.Model = R3GAN.Networks.Discriminator(*args, **config)
         
-    def forward(self, x, c):
-        return self.Model(x, c)
+    def forward(self, x, c, aug):
+        return self.Model(x, c, aug)

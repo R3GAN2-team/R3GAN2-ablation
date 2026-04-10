@@ -202,13 +202,24 @@ def training_loop(
         print('Label shape:', training_set.label_shape)
         print()
         
+    # Setup augmentation.
+    if rank == 0:
+        print('Setting up augmentation...')
+    augment_pipe = None
+
+    if (augment_kwargs is not None) and (aug_scheduler is not None):
+        augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
+        _, augment_label = augment_pipe([ref_image.to(torch.float32)])
+        augment_label_dim = augment_label.shape[1]
+        if rank == 0:
+            print('Augment label dim: ', augment_label_dim)
 
     # Construct networks.
     if rank == 0:
         print('Constructing networks...')
     common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=training_set.resolution, img_channels=ref_image.shape[1])
     G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
-    D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
+    D = dnnlib.util.construct_class_by_name(AugmentationLabelDimension=augment_label_dim, **D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     ema = dnnlib.util.construct_class_by_name(net=G, **ema_kwargs)
     ema_preview = ema.emas[1]
 
@@ -227,16 +238,9 @@ def training_loop(
         z = torch.empty([min(g_batch_gpu, d_batch_gpu), G.z_dim], device=device)
         c = torch.empty([min(g_batch_gpu, d_batch_gpu), G.c_dim], device=device)
         img = misc.print_module_summary(G, [z, c])
-        misc.print_module_summary(D, [img, c])
+        _, aug_labels = augment_pipe([img.to(torch.float32)])
+        misc.print_module_summary(D, [img, c, aug_labels])
 
-    # Setup augmentation.
-    if rank == 0:
-        print('Setting up augmentation...')
-    augment_pipe = None
-
-    if (augment_kwargs is not None) and (aug_scheduler is not None):
-        augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
-        
     # Distribute across GPUs.
     if rank == 0:
         print(f'Distributing across {num_gpus} GPUs...')

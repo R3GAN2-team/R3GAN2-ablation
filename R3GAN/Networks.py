@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 from .Resamplers import InterpolativeUpsampler, InterpolativeDownsampler
-from .MagnitudePreservingLayers import LeakyReLU, Convolution, Linear, BiasedPointwiseConvolution, BiasedPointwiseConvolutionWithNoiseInjection, GenerativeBasis, DiscriminativeBasis, BoundedParameter, ClassEmbedder
+from .MagnitudePreservingLayers import Normalize, LeakyReLU, Convolution, Linear, BiasedPointwiseConvolution, BiasedPointwiseConvolutionWithNoiseInjection, GenerativeBasis, DiscriminativeBasis, BoundedParameter, ClassEmbedder
 
 class FeedForwardNetwork(nn.Module):
     def __init__(self, FirstConvolutionType, InputChannels, HiddenChannels, ChannelsPerGroup, KernelSize):
@@ -134,7 +134,7 @@ class Generator(nn.Module):
         return self.AggregationLayer(x, Gain=self.Gain * torch.rsqrt(AccumulatedVariance).view(1, -1, 1, 1))
 
 class Discriminator(nn.Module):
-    def __init__(self, InputChannels, WidthPerStage, BlocksPerStage, FFNWidthRatio, ChannelsPerConvolutionGroup, NumberOfClasses=None, ClassEmbeddingDimension=0, KernelSize=3, ResamplingFilter=[1, 2, 1]):
+    def __init__(self, InputChannels, WidthPerStage, BlocksPerStage, FFNWidthRatio, ChannelsPerConvolutionGroup, NumberOfClasses=None, AugmentationLabelDimension=None, ClassEmbeddingDimension=0, KernelSize=3, ResamplingFilter=[1, 2, 1]):
         super(Discriminator, self).__init__()
         
         self.MainLayers = nn.ModuleList(BuildResidualGroups(WidthPerStage, BlocksPerStage, BiasedPointwiseConvolution, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize))
@@ -145,10 +145,16 @@ class Discriminator(nn.Module):
         
         if NumberOfClasses is not None:
             self.EmbeddingLayer = ClassEmbedder(NumberOfClasses, ClassEmbeddingDimension)
+
+        self.AugmentationMap = Linear(AugmentationLabelDimension, ClassEmbeddingDimension)
+        self.AugmentationLabelGain = nn.Parameter(torch.zeros([]))
         
-    def forward(self, x, y=None):
+    def forward(self, x, y=None, aug=None):
+        aug = self.AugmentationMap(aug, Gain=self.AugmentationLabelGain)
+
         if hasattr(self, 'EmbeddingLayer'):
             y = self.EmbeddingLayer(y)
+            y = Normalize(y + aug, Dimensions=1)
         x = self.ExtractionLayer(x.to(torch.bfloat16))
         
         for Layer, Transition in zip(self.MainLayers[:-1], self.TransitionLayers):

@@ -15,10 +15,10 @@ class AdversarialTraining:
     def AccumulateGeneratorGradients(self, Noise, RealSamples, Conditions, Scale=1):
         FakeSamples = self.Generator(Noise, Conditions)
         RealSamples = RealSamples.detach()
-        TransformedFakeSamples, TransformedRealSamples = self.Preprocessor([FakeSamples, RealSamples])
+        [TransformedFakeSamples, TransformedRealSamples], AugmentationLabels = self.Preprocessor([FakeSamples, RealSamples])
         
-        FakeLogits = self.Discriminator(TransformedFakeSamples, Conditions)
-        RealLogits = self.Discriminator(TransformedRealSamples, Conditions)
+        FakeLogits = self.Discriminator(TransformedFakeSamples, Conditions, AugmentationLabels)
+        RealLogits = self.Discriminator(TransformedRealSamples, Conditions, AugmentationLabels)
         
         RelativisticLogits = FakeLogits - RealLogits
         AdversarialLoss = nn.functional.softplus(-RelativisticLogits)
@@ -30,10 +30,10 @@ class AdversarialTraining:
     def AccumulateDiscriminatorGradients(self, Noise, RealSamples, Conditions, Gamma, Scale=1):
         RealSamples = RealSamples.detach().requires_grad_(True)
         FakeSamples = self.Generator(Noise, Conditions).detach().requires_grad_(True)
-        TransformedRealSamples, TransformedFakeSamples = self.Preprocessor([RealSamples, FakeSamples])
+        [TransformedRealSamples, TransformedFakeSamples], AugmentationLabels = self.Preprocessor([RealSamples, FakeSamples])
         
-        RealLogits = self.Discriminator(TransformedRealSamples, Conditions)
-        FakeLogits = self.Discriminator(TransformedFakeSamples, Conditions)
+        RealLogits = self.Discriminator(TransformedRealSamples, Conditions, AugmentationLabels)
+        FakeLogits = self.Discriminator(TransformedFakeSamples, Conditions, AugmentationLabels)
         
         R1Penalty = AdversarialTraining.ZeroCenteredGradientPenalty(RealSamples, RealLogits)
         R2Penalty = AdversarialTraining.ZeroCenteredGradientPenalty(FakeSamples, FakeLogits)

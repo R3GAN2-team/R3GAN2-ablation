@@ -17,7 +17,10 @@ import torch
 class R3GANLoss:
     def __init__(self, G, D, augment_pipe=None):
         if augment_pipe is not None:
-            preprocessor = lambda images_list: [y.to(images_list[0].dtype) for y in augment_pipe([x.to(torch.float32) for x in images_list])]
+            def preprocessor(images_list):
+                images_dtype = images_list[0].dtype
+                images_list, labels = augment_pipe([x.to(torch.float32) for x in images_list])
+                return [y.to(images_dtype) for y in images_list], labels
             self.trainer = AdversarialTraining(G, D, preprocessor)
         else:
             self.trainer = AdversarialTraining(G, D)
@@ -47,6 +50,8 @@ class R3GANLoss:
             training_stats.report('Loss/D/loss', AdversarialLoss)
             training_stats.report('Loss/r1_penalty', R1Penalty)
             training_stats.report('Loss/r2_penalty', R2Penalty)
+
+            training_stats.report('Progress/aug_gain', self.trainer.Discriminator.Model.AugmentationLabelGain)
             
             for i, l in enumerate(self.trainer.Discriminator.Model.MainLayers):
                 for j, a in enumerate(l.ParametrizedAlphas):
