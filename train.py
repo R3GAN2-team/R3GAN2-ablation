@@ -185,7 +185,7 @@ def main(**kwargs):
         WidthPerStage = [x // 2 for x in [1024, 1024, 1024]]
         BlocksPerStage = [['FFN', 'FFN', 'FFN', 'FFN'], ['FFN', 'FFN', 'FFN', 'FFN'], ['FFN', 'FFN', 'FFN', 'FFN']]
         NoiseDimension = 64
-        aug_config = dict(always_xflip=True, yflip=1, rotate_int=1, translate_int=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1)
+        aug_config = dict(always_xflip=True, yflip=1, rotate_int=1, translate_int=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1)
         ema_stds = [0.010, 0.050, 0.100]
        
         c.G_kwargs.ClassEmbeddingDimension = NoiseDimension
@@ -193,7 +193,7 @@ def main(**kwargs):
        
         decay_nimg = 2e7
        
-        c.aug_scheduler = { 'base_value': 0.55, 'final_value': 0.55, 'total_nimg': decay_nimg }
+        c.aug_scheduler = { 'base_value': 0, 'final_value': 0.55, 'total_nimg': decay_nimg }
         c.lr_scheduler = { 'batch_size': 512, 'ref_lr': 100e-4, 'ref_batches': 1e3, 'rampup_Mimg': 1 }
         c.gamma_scheduler = { 'base_value': 0.05, 'final_value': 0.005, 'total_nimg': decay_nimg }
         c.beta2_scheduler = { 'base_value': 0.9, 'final_value': 0.99, 'total_nimg': decay_nimg }

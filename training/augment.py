@@ -97,35 +97,6 @@ def scale_channels(num_channels, s):
         C[:, i, i] = s
     return C.clone()
 
-def generate_orthogonal_span(v):
-    v = v[:-1]
-    
-    sorted_idx = torch.argsort(v.abs())
-    i = sorted_idx[0].item()
-    j = sorted_idx[1].item()
-    
-    e_i = torch.zeros_like(v)
-    e_i[i] = 1
-    e_j = torch.zeros_like(v)
-    e_j[j] = 1
-    
-    u = e_i - (v @ e_i) * v
-    u = u / u.norm()
-    
-    w = e_j - (v @ e_j) * v - (u @ e_j) / (u @ u) * u
-    w = w / w.norm()
-    
-    S = torch.outer(u, w) - torch.outer(w, u)
-    return S.clone()
-
-def rotate_channels(S, theta):
-    C = torch.eye(S.shape[0] + 1, device=theta.device).unsqueeze(0).repeat(theta.shape[0], 1, 1)
-    S = S.unsqueeze(0).repeat(theta.shape[0], 1, 1)
-    theta = -theta.view(-1, 1, 1)
-    R = torch.matrix_exp(S * theta)
-    C[:, :R.shape[1], :R.shape[2]] = R
-    return C.clone()
-
 #----------------------------------------------------------------------------
 # Versatile image augmentation pipeline from the paper
 # "Training Generative Adversarial Networks with Limited Data".
@@ -136,12 +107,16 @@ def rotate_channels(S, theta):
 @persistence.persistent_class
 class AugmentPipe(torch.nn.Module):
     def __init__(self,
+        num_channels=3,
         always_xflip=False, xflip=0, yflip=0, rotate_int=0, translate_int=0, translate_int_max=0.125,
         scale=0, rotate_frac=0, aniso=0, translate_frac=0, scale_std=0.2, rotate_frac_max=1, aniso_std=0.2, aniso_rotate_prob=0.5, translate_frac_std=0.125,
+        brightness=0, contrast=0, lumaflip=0, hue=0, saturation=0, brightness_std=0.2, contrast_std=0.5, hue_max=1, saturation_std=1,
     ):
         super().__init__()
         self.register_buffer('p', torch.ones([]))       # Overall multiplier for augmentation probability.
 
+        self.num_channels       = num_channels
+        
         # Pixel blitting.
         self.always_xflip       = always_xflip
         self.xflip              = float(xflip)              # Probability multiplier for x-flip.
@@ -160,6 +135,17 @@ class AugmentPipe(torch.nn.Module):
         self.aniso_std          = float(aniso_std)          # Log2 standard deviation of anisotropic scaling.
         self.aniso_rotate_prob  = float(aniso_rotate_prob)  # Probability of doing anisotropic scaling w.r.t. rotated coordinate frame.
         self.translate_frac_std = float(translate_frac_std) # Standard deviation of frational translation, relative to image dimensions.
+
+        # Color transformations.
+        self.brightness         = float(brightness)         # Probability multiplier for brightness.
+        self.contrast           = float(contrast)           # Probability multiplier for contrast.
+        self.lumaflip           = float(lumaflip)           # Probability multiplier for luma flip.
+        self.hue                = float(hue)                # Probability multiplier for hue rotation.
+        self.saturation         = float(saturation)         # Probability multiplier for saturation.
+        self.brightness_std     = float(brightness_std)     # Standard deviation of brightness.
+        self.contrast_std       = float(contrast_std)       # Log2 standard deviation of contrast.
+        self.hue_max            = float(hue_max)            # Range of hue rotation, 1 = full circle.
+        self.saturation_std     = float(saturation_std)     # Log2 standard deviation of saturation.
 
         # Setup orthogonal lowpass filter for geometric augmentations.
         self.register_buffer('Hz_geom', upfirdn2d.setup_filter(wavelets['sym6']))
@@ -294,6 +280,59 @@ class AugmentPipe(torch.nn.Module):
             images = upfirdn2d.downsample2d(x=images, f=self.Hz_geom, down=2, padding=-Hz_pad*2, flip_filter=True)
 
         images_list = list(torch.split(images, channel_sizes, dim=1))
+
+        # --------------------------------------------
+        # Select parameters for color transformations.
+        # --------------------------------------------
+
+        I_C = torch.eye(self.num_channels + 1, device=device)
+        C = I_C
+        luma_axis = misc.constant(np.asarray([1 for _ in range(self.num_channels)] + [0]) / np.sqrt(self.num_channels), device=device)
+
+        if self.brightness > 0:
+            w = torch.randn([N], device=device)
+            w = torch.where(torch.rand([N], device=device) < self.brightness * self.p, w, torch.zeros_like(w))
+            b = w * self.brightness_std
+            C = translate_channels(self.num_channels, b) @ C
+            labels += [w]
+
+        if self.contrast > 0:
+            w = torch.randn([N], device=device)
+            w = torch.where(torch.rand([N], device=device) < self.contrast * self.p, w, torch.zeros_like(w))
+            c = w.mul(self.contrast_std).exp2()
+            C = scale_channels(self.num_channels, c) @ C
+            labels += [w]
+
+        if self.lumaflip > 0:
+            w = torch.randint(2, [N, 1, 1], device=device)
+            w = torch.where(torch.rand([N, 1, 1], device=device) < self.lumaflip * self.p, w, torch.zeros_like(w))
+            C = (I_C - 2 * luma_axis.ger(luma_axis) * w) @ C
+            labels += [w]
+
+        # if self.hue > 0:
+        #     w = (torch.rand([N], device=device) * 2 - 1) * (np.pi * self.hue_max)
+        #     w = torch.where(torch.rand([N], device=device) < self.hue * self.p, w, torch.zeros_like(w))
+        #     M = rotate3d(luma_axis, w) @ M
+        #     labels += [w.cos() - 1, w.sin()]
+
+        if self.saturation > 0:
+            w = torch.randn([N, 1, 1], device=device)
+            w = torch.where(torch.rand([N, 1, 1], device=device) < self.saturation * self.p, w, torch.zeros_like(w))
+            C = (luma_axis.ger(luma_axis) + (I_C - luma_axis.ger(luma_axis)) * w.mul(self.saturation_std).exp2()) @ C
+            labels += [w]
+
+
+        # ------------------------------
+        # Execute color transformations.
+        # ------------------------------
+
+        # Execute if the transform is not identity.
+        if C is not I_C:
+            images_list = [images.reshape([N, self.num_channels, H * W]) for images in images_list]
+            images_list = [(C[:, :self.num_channels, :self.num_channels] @ images + C[:, :self.num_channels, self.num_channels:]) for images in images_list]
+            images_list = [images.reshape([N, self.num_channels, H, W]) for images in images_list]
+
+
         labels = torch.cat([x.to(torch.float32).reshape(N, -1) for x in labels], dim=1)
         return images_list, labels
 
