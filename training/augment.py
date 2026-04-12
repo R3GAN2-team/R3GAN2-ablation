@@ -85,17 +85,16 @@ def scale2d_inv(sx, sy, **kwargs):
 def rotate2d_inv(theta, **kwargs):
     return rotate2d(-theta, **kwargs)
 
-def translate_channels(num_channels, t):
+def translate_along_axis(axis, t):
+    num_channels = axis.numel() - 1
     C = torch.eye(num_channels + 1, device=t.device).unsqueeze(0).repeat(t.shape[0], 1, 1)
-    for i in range(num_channels):
-        C[:, i, -1] = t
-    return C.clone()
+    C[:, :num_channels, num_channels] = t[:, None] * axis[:num_channels][None, :] * np.sqrt(num_channels)
+    return C.detach().clone()
 
 def scale_channels(num_channels, s):
     C = torch.eye(num_channels + 1, device=s.device).unsqueeze(0).repeat(s.shape[0], 1, 1)
-    for i in range(num_channels):
-        C[:, i, i] = s
-    return C.clone()
+    C[:, :num_channels, :num_channels] *= s[:, None, None]
+    return C.detach().clone()
 
 #----------------------------------------------------------------------------
 # Versatile image augmentation pipeline from the paper
@@ -107,15 +106,18 @@ def scale_channels(num_channels, s):
 @persistence.persistent_class
 class AugmentPipe(torch.nn.Module):
     def __init__(self,
-        num_channels=3,
         always_xflip=False, xflip=0, yflip=0, rotate_int=0, translate_int=0, translate_int_max=0.125,
         scale=0, rotate_frac=0, aniso=0, translate_frac=0, scale_std=0.2, rotate_frac_max=1, aniso_std=0.2, aniso_rotate_prob=0.5, translate_frac_std=0.125,
-        brightness=0, contrast=0, lumaflip=0, hue=0, saturation=0, brightness_std=0.2, contrast_std=0.5, hue_max=1, saturation_std=1,
+        principal_axis=[0.568731427192688, 0.5950939059257507, 0.5678096413612366],
+        brightness=0, contrast=0, lumaflip=0, chromaflip=0, saturation=0, brightness_std=0.2, contrast_std=0.5, saturation_std=1,
     ):
         super().__init__()
         self.register_buffer('p', torch.ones([]))       # Overall multiplier for augmentation probability.
 
-        self.num_channels       = num_channels
+        self.num_channels       = len(principal_axis)
+        principal_axis          = np.asarray(principal_axis)
+        principal_axis          = principal_axis / np.linalg.norm(principal_axis)
+        self.principal_axis     = np.append(principal_axis, 0)
         
         # Pixel blitting.
         self.always_xflip       = always_xflip
@@ -140,11 +142,10 @@ class AugmentPipe(torch.nn.Module):
         self.brightness         = float(brightness)         # Probability multiplier for brightness.
         self.contrast           = float(contrast)           # Probability multiplier for contrast.
         self.lumaflip           = float(lumaflip)           # Probability multiplier for luma flip.
-        self.hue                = float(hue)                # Probability multiplier for hue rotation.
+        self.chromaflip         = float(chromaflip)         # Probability multiplier for chroma flip.
         self.saturation         = float(saturation)         # Probability multiplier for saturation.
         self.brightness_std     = float(brightness_std)     # Standard deviation of brightness.
         self.contrast_std       = float(contrast_std)       # Log2 standard deviation of contrast.
-        self.hue_max            = float(hue_max)            # Range of hue rotation, 1 = full circle.
         self.saturation_std     = float(saturation_std)     # Log2 standard deviation of saturation.
 
         # Setup orthogonal lowpass filter for geometric augmentations.
@@ -287,13 +288,13 @@ class AugmentPipe(torch.nn.Module):
 
         I_C = torch.eye(self.num_channels + 1, device=device)
         C = I_C
-        luma_axis = misc.constant(np.asarray([1 for _ in range(self.num_channels)] + [0]) / np.sqrt(self.num_channels), device=device)
+        luma_axis = misc.constant(self.principal_axis, device=device)
 
         if self.brightness > 0:
             w = torch.randn([N], device=device)
             w = torch.where(torch.rand([N], device=device) < self.brightness * self.p, w, torch.zeros_like(w))
             b = w * self.brightness_std
-            C = translate_channels(self.num_channels, b) @ C
+            C = translate_along_axis(luma_axis, b) @ C
             labels += [w]
 
         if self.contrast > 0:
@@ -309,11 +310,16 @@ class AugmentPipe(torch.nn.Module):
             C = (I_C - 2 * luma_axis.ger(luma_axis) * w) @ C
             labels += [w]
 
-        # if self.hue > 0:
-        #     w = (torch.rand([N], device=device) * 2 - 1) * (np.pi * self.hue_max)
-        #     w = torch.where(torch.rand([N], device=device) < self.hue * self.p, w, torch.zeros_like(w))
-        #     M = rotate3d(luma_axis, w) @ M
-        #     labels += [w.cos() - 1, w.sin()]
+        if self.chromaflip > 0:
+            w = torch.randint(2, [N, 1, 1], device=device)
+            w = torch.where(torch.rand([N, 1, 1], device=device) < self.chromaflip * self.p, w, torch.zeros_like(w))
+            
+            T = -I_C
+            T[self.num_channels, self.num_channels] = 1
+            T = T + 2 * luma_axis.ger(luma_axis)
+            C = (I_C + w * (T - I_C)) @ C
+
+            labels += [w]
 
         if self.saturation > 0:
             w = torch.randn([N, 1, 1], device=device)
