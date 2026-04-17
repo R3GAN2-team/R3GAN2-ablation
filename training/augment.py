@@ -110,6 +110,7 @@ class AugmentPipe(torch.nn.Module):
         scale=0, rotate_frac=0, aniso=0, translate_frac=0, scale_std=0.2, rotate_frac_max=1, aniso_std=0.2, aniso_rotate_prob=0.5, translate_frac_std=0.125,
         principal_axis=[0.568731427192688, 0.5950939059257507, 0.5678096413612366],
         brightness=0, contrast=0, lumaflip=0, chromaflip=0, saturation=0, brightness_std=0.2, contrast_std=0.5, saturation_std=1,
+        cutout=0, cutout_size=0.5,
     ):
         super().__init__()
         self.register_buffer('p', torch.ones([]))       # Overall multiplier for augmentation probability.
@@ -147,6 +148,10 @@ class AugmentPipe(torch.nn.Module):
         self.brightness_std     = float(brightness_std)     # Standard deviation of brightness.
         self.contrast_std       = float(contrast_std)       # Log2 standard deviation of contrast.
         self.saturation_std     = float(saturation_std)     # Log2 standard deviation of saturation.
+
+        # Image-space corruptions.
+        self.cutout           = float(cutout)           # Probability multiplier for cutout.
+        self.cutout_size      = float(cutout_size)      # Size of the cutout rectangle, relative to image dimensions.
 
         # Setup orthogonal lowpass filter for geometric augmentations.
         self.register_buffer('Hz_geom', upfirdn2d.setup_filter(wavelets['sym6']))
@@ -337,6 +342,50 @@ class AugmentPipe(torch.nn.Module):
             images_list = [images.reshape([N, self.num_channels, H * W]) for images in images_list]
             images_list = [(C[:, :self.num_channels, :self.num_channels] @ images + C[:, :self.num_channels, self.num_channels:]) for images in images_list]
             images_list = [images.reshape([N, self.num_channels, H, W]) for images in images_list]
+
+
+
+
+
+
+
+        # Apply cutout with probability (cutout * strength).
+        if self.cutout > 0:
+            size = torch.full([N, 2, 1, 1, 1], self.cutout_size, device=device)
+            size = torch.where(torch.rand([N, 1, 1, 1, 1], device=device) < self.cutout * self.p, size, torch.zeros_like(size))
+            center = torch.rand([N, 2, 1, 1, 1], device=device)
+            coord_x = torch.arange(W, device=device).reshape([1, 1, 1, -1])
+            coord_y = torch.arange(H, device=device).reshape([1, 1, -1, 1])
+            mask_x = (((coord_x + 0.5) / W - center[:, 0]).abs() >= size[:, 0] / 2)
+            mask_y = (((coord_y + 0.5) / H - center[:, 1]).abs() >= size[:, 1] / 2)
+            mask_x, mask_y = torch.broadcast_tensors(mask_x, mask_y)
+            mask = torch.logical_or(mask_x, mask_y).to(torch.float32)
+
+            results = []
+            for images in images_list:
+                std, mean = torch.std_mean(images, correction=0, dim=[2, 3], keepdim=True)
+                noise = std * torch.randn([N, self.num_channels, H, W], device=device) + mean
+                results += [images * mask + noise * (1 - mask)]
+            images_list = results
+
+        
+
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
         labels = torch.cat([x.to(torch.float32).reshape(N, -1) for x in labels], dim=1)

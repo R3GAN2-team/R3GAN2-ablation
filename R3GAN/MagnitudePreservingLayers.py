@@ -126,11 +126,11 @@ class DiscriminativeBasis(nn.Module):
         return self.Basis(x).view(x.shape[0], -1)
     
 class ClassEmbedder(nn.Module):
-    def __init__(self, NumberOfClasses, EmbeddingDimension):
+    def __init__(self, NumberOfClasses, EmbeddingDimension, Centered=True):
         super(ClassEmbedder, self).__init__()
         
-        self.Weight = NormalizedWeight(EmbeddingDimension, NumberOfClasses, 1, [], True)
-        self.Weight.Weight.data.copy_(NormalizedWeight(EmbeddingDimension, 1, 1, [], True)().repeat(NumberOfClasses, 1))
+        self.Weight = NormalizedWeight(EmbeddingDimension, NumberOfClasses, 1, [], Centered)
+        self.Weight.Weight.data.copy_(NormalizedWeight(EmbeddingDimension, 1, 1, [], Centered)().repeat(NumberOfClasses, 1))
     
     def forward(self, x):
         return x @ self.Weight().to(x.dtype)

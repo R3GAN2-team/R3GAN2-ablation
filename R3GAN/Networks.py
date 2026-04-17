@@ -144,7 +144,7 @@ class Discriminator(nn.Module):
         self.ExtractionLayer = Convolution(InputChannels, WidthPerStage[0], KernelSize=1)
         
         if NumberOfClasses is not None:
-            self.EmbeddingLayer = ClassEmbedder(NumberOfClasses, ClassEmbeddingDimension)
+            self.EmbeddingLayer = ClassEmbedder(NumberOfClasses, ClassEmbeddingDimension, Centered=False)
 
         self.AugmentationMap = Linear(AugmentationLabelDimension, ClassEmbeddingDimension)
         self.AugmentationLabelGain = nn.Parameter(torch.zeros([]))
