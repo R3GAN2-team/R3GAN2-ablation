@@ -56,21 +56,35 @@ class Encoder:
         raise NotImplementedError # to be overridden by subclass
 
 #----------------------------------------------------------------------------
-# Standard RGB encoder that scales the pixel data into [-1, +1].
+# Standard RGB encoder.
 
 @persistence.persistent_class
 class StandardRGBEncoder(Encoder):
-    def __init__(self):
+    def __init__(self,
+        raw_mean    = [125.30691528320312, 122.95039367675781, 113.86538696289062], # per-channel mean of the dataset.
+        raw_std     = [62.99321746826172, 62.088706970214844, 66.70490264892578],   # per-channel standard deviation of the dataset.
+        final_mean  = 0,                                                            # Desired mean of the final latents.
+        final_std   = 0.5,                                                          # Desired standard deviation of the final latents.                 
+    ):
         super().__init__()
+        self.scale = np.float32(final_std) / np.float32(raw_std)
+        self.bias = np.float32(final_mean) - np.float32(raw_mean) * self.scale
 
     def encode_pixels(self, x): # raw pixels => raw latents
         return x
 
     def encode_latents(self, x): # raw latents => final latents
-        return x.to(torch.float32) / 127.5 - 1
+        x = x.to(torch.float32)
+        x = x * misc.const_like(x, self.scale).reshape(1, -1, 1, 1)
+        x = x + misc.const_like(x, self.bias).reshape(1, -1, 1, 1)
+        return x
 
     def decode(self, x): # final latents => raw pixels
-        return (x.to(torch.float32) * 127.5 + 128).clip(0, 255).to(torch.uint8)
+        x = x.to(torch.float32)
+        x = x - misc.const_like(x, self.bias).reshape(1, -1, 1, 1)
+        x = x / misc.const_like(x, self.scale).reshape(1, -1, 1, 1)
+        x = x.round().clip(0, 255).to(torch.uint8)
+        return x
 
 #----------------------------------------------------------------------------
 # Pre-trained VAE encoder from Stability AI.
