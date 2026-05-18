@@ -423,21 +423,25 @@ class Generator(nn.Module):
     def forward(self, x, y=None):
         x = torch.cat([x, self.EmbeddingLayer(y)], dim=1) if hasattr(self, 'EmbeddingLayer') else x
 
-        # Generator head is the NCHW island.
+        # Generator head/resampler is an NCHW island.
         x = ToNCHWContiguous(self.Head(x).to(torch.bfloat16))
 
-        # Everything after the head runs NHWC/channels-last, including
-        # residual groups, resampling transitions, and aggregation.
+        # Residual groups run NHWC/channels-last.
         x = ToChannelsLast(x)
 
         for Layer, Transition in zip(self.MainLayers[:-1], self.TransitionLayers):
             x, AccumulatedVariance = Layer(x)
+
+            # Upsample/resampler is an NCHW island.
+            x = ToNCHWContiguous(x)
             x = Transition(x, Gain=torch.rsqrt(AccumulatedVariance))
+
+            # Next residual group runs NHWC/channels-last.
             x = ToChannelsLast(x)
 
         x, AccumulatedVariance = self.MainLayers[-1](x)
 
-        x = ToChannelsLast(x)
+        # Aggregation is a conv immediately after residual groups; keep NHWC.
         return self.AggregationLayer(x, Gain=self.Gain * torch.rsqrt(AccumulatedVariance).view(1, -1, 1, 1))
 
     def CompileMainLayers(self, mode='default', fullgraph=False, dynamic=False):
@@ -469,21 +473,24 @@ class Discriminator(nn.Module):
     def forward(self, x, y=None):
         if hasattr(self, 'EmbeddingLayer'):
             y = self.EmbeddingLayer(y)
+        x = self.ExtractionLayer(x.to(torch.bfloat16))
 
-        # Extraction also runs NHWC/channels-last.
-        x = ToChannelsLast(x.to(torch.bfloat16))
-        x = self.ExtractionLayer(x)
+        # Residual groups run NHWC/channels-last.
         x = ToChannelsLast(x)
 
-        # Residual groups and downsample transitions run NHWC/channels-last.
         for Layer, Transition in zip(self.MainLayers[:-1], self.TransitionLayers):
             x, AccumulatedVariance = Layer(x)
+
+            # Downsample/resampler is an NCHW island.
+            x = ToNCHWContiguous(x)
             x = Transition(x, Gain=torch.rsqrt(AccumulatedVariance))
+
+            # Next residual group runs NHWC/channels-last.
             x = ToChannelsLast(x)
 
         x, AccumulatedVariance = self.MainLayers[-1](x)
 
-        # Discriminator head/resampler/basis is the NCHW island.
+        # Discriminator head/resampler/basis is an NCHW island.
         x = ToNCHWContiguous(x)
         x = self.Head(x.to(torch.float32), Gain=torch.rsqrt(AccumulatedVariance))
         x = (x * y / math.sqrt(y.shape[1])).sum(dim=1, keepdim=True) if hasattr(self, 'EmbeddingLayer') else x
@@ -500,8 +507,7 @@ class Discriminator(nn.Module):
 
     def ForwardToStage0(self, x, y=None):
         y = self.EmbedConditions(y)
-        x = ToChannelsLast(x.to(torch.bfloat16))
-        x = self.ExtractionLayer(x)
+        x = self.ExtractionLayer(x.to(torch.bfloat16))
         x = ToChannelsLast(x)
         return x, y
 
@@ -516,10 +522,12 @@ class Discriminator(nn.Module):
         and for wrappers/tests.
         """
         for Index in range(StageIndex, len(self.TransitionLayers)):
-            # Transition/downsample also runs NHWC/channels-last.
+            # Transition/downsample island is NCHW.
+            x = ToNCHWContiguous(x)
             x = self.TransitionLayers[Index](x, Gain=torch.rsqrt(AccumulatedVariance))
-            x = ToChannelsLast(x)
 
+            # Next residual group runs NHWC/channels-last.
+            x = ToChannelsLast(x)
             Layer = self.MainLayers[Index + 1]
             if UseCompiled:
                 x, AccumulatedVariance = Layer(x)
@@ -578,8 +586,8 @@ class Discriminator(nn.Module):
         """Run all residual stages plus head with caches for explicit VJP.
 
         Input x is expected to be after ExtractionLayer. y is expected to be
-        already embedded by ForwardToStage0().  Everything except the final
-        discriminator head runs NHWC/channels-last.
+        already embedded by ForwardToStage0().  Residual groups run
+        NHWC/channels-last; transitions and head are NCHW islands.
         """
         StageOutputs = []
         StageCaches = []
@@ -593,21 +601,23 @@ class Discriminator(nn.Module):
         StageCaches.append(Caches)
         AccumulatedVariances.append(AccumulatedVariance)
 
-        # Transitions + later residual stages. Resamplers support channels-last,
-        # so do not bounce through NCHW here.
+        # Transitions + later residual stages.
         for Index, Transition in enumerate(self.TransitionLayers):
             TransitionGain = torch.rsqrt(AccumulatedVariance)
 
+            # Transition/downsample island is NCHW.
+            x = ToNCHWContiguous(x)
             x, TransitionCache = Transition.forward_with_cache(x, Gain=TransitionGain)
-            x = ToChannelsLast(x)
             TransitionCaches.append(TransitionCache)
 
+            # Next residual stage is NHWC.
+            x = ToChannelsLast(x)
             x, AccumulatedVariance, Caches = self.MainLayers[Index + 1].forward_with_cache(x)
             StageOutputs.append(x)
             StageCaches.append(Caches)
             AccumulatedVariances.append(AccumulatedVariance)
 
-        # Head is the NCHW island.
+        # Head island is NCHW.
         HeadInput = ToNCHWContiguous(x)
         HeadOut, HeadCache = self.Head.forward_with_cache(
             HeadInput.to(torch.float32),
@@ -669,8 +679,11 @@ class Discriminator(nn.Module):
 
         # Walk backward through transition + previous residual stage.
         for Index in reversed(range(len(self.TransitionLayers))):
-            # Transitions also run NHWC/channels-last.
+            # Forward transition ran in NCHW.
+            v = ToNCHWContiguous(v)
             v = self.TransitionLayers[Index].explicit_vjp(v, TransitionCaches[Index])
+
+            # Previous residual stage ran NHWC/channels-last.
             v = ToChannelsLast(v)
             v = self.MainLayers[Index].explicit_vjp_from_cache(
                 v,

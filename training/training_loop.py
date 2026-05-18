@@ -158,6 +158,9 @@ def training_loop(
     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
     progress_fn             = None,     # Callback function for updating training progress. Called for all ranks.
+    compile_main_layers = False, # compile is broken
+    compile_mode = 'default',
+    compile_fullgraph = False,
 ):
     # Initialize.
     start_time = time.time()
@@ -167,6 +170,16 @@ def training_loop(
     torch.backends.cudnn.benchmark = cudnn_benchmark    # Improves training speed.
     torch.backends.cuda.matmul.allow_tf32 = False       # Improves numerical accuracy.
     torch.backends.cudnn.allow_tf32 = False             # Improves numerical accuracy.
+    
+    torch.backends.fp32_precision = "ieee"
+    torch.backends.cuda.matmul.fp32_precision = "ieee"
+    torch.backends.cudnn.fp32_precision = "ieee"
+    torch.backends.cudnn.conv.fp32_precision = "ieee"
+    torch.backends.cudnn.rnn.fp32_precision = "ieee"
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_accumulation = False
+    
     conv2d_gradfix.enabled = True                       # Improves training speed.
     grid_sample_gradfix.enabled = True                  # Avoids errors with the augmentation pipe.
           
@@ -244,6 +257,77 @@ def training_loop(
         if module is not None and num_gpus > 1:
             for param in misc.params_and_buffers(module):
                 torch.distributed.broadcast(param, src=0)
+
+
+
+    # Compile only FFN-heavy residual groups. Do not compile the full model,
+    # R1 function, or StyleGAN upfirdn2d transition layers.
+    if compile_main_layers:
+        if rank == 0:
+            print(f'Compiling G/D main residual groups with torch.compile(mode={compile_mode})...')
+
+        try:
+            import importlib
+            dynamo = importlib.import_module("torch._dynamo")
+            dynamo.config.recompile_limit = 128
+            dynamo.config.cache_size_limit = 128
+        except Exception:
+            pass
+
+        # Compile G main layers per stage with static shapes.
+        target = G.Model if hasattr(G, 'Model') else G
+        if hasattr(target, 'MainLayers'):
+            for stage_idx, layer in enumerate(target.MainLayers):
+                if hasattr(layer, 'CompileForward'):
+                    if rank == 0:
+                        print(f'  Compiling G.MainLayers[{stage_idx}] static...')
+                    layer.CompileForward(
+                        mode=compile_mode,
+                        fullgraph=compile_fullgraph,
+                        dynamic=False,
+                    )
+                elif rank == 0:
+                    print(f'Warning: G.MainLayers[{stage_idx}] does not expose CompileForward().')
+        elif hasattr(target, 'CompileMainLayers'):
+            if rank == 0:
+                print(f'Warning: {type(target).__name__} has no MainLayers; falling back to CompileMainLayers(dynamic=False).')
+            target.CompileMainLayers(
+                mode=compile_mode,
+                fullgraph=compile_fullgraph,
+                dynamic=False,
+            )
+        else:
+            if rank == 0:
+                print(f'Warning: {type(target).__name__} does not expose MainLayers or CompileMainLayers().')
+
+        # Compile D main layers per stage with static shapes.
+        target = D.Model if hasattr(D, 'Model') else D
+        if hasattr(target, 'MainLayers'):
+            for stage_idx, layer in enumerate(target.MainLayers):
+                if hasattr(layer, 'CompileForward'):
+                    if rank == 0:
+                        print(f'  Compiling D.MainLayers[{stage_idx}] static...')
+                    layer.CompileForward(
+                        mode=compile_mode,
+                        fullgraph=compile_fullgraph,
+                        dynamic=False,
+                    )
+                elif rank == 0:
+                    print(f'Warning: D.MainLayers[{stage_idx}] does not expose CompileForward().')
+        elif hasattr(target, 'CompileMainLayers'):
+            if rank == 0:
+                print(f'Warning: {type(target).__name__} has no MainLayers; falling back to CompileMainLayers(dynamic=False).')
+            target.CompileMainLayers(
+                mode=compile_mode,
+                fullgraph=compile_fullgraph,
+                dynamic=False,
+            )
+        else:
+            if rank == 0:
+                print(f'Warning: {type(target).__name__} does not expose MainLayers or CompileMainLayers().')
+
+
+
 
     # Setup training phases.
     if rank == 0:
@@ -341,9 +425,9 @@ def training_loop(
             all_real_c += [G_img_c.detach().clone().to(device).split(g_batch_gpu)]
             all_gen_z += [G_z.detach().clone().split(g_batch_gpu)]
         
-        cur_lr = edm2_learning_rate_schedule(cur_nimg, **lr_scheduler)
-        cur_beta2 = cosine_decay_with_warmup(cur_nimg, **beta2_scheduler)
-        cur_gamma = cosine_decay_with_warmup(cur_nimg, **gamma_scheduler)
+        cur_lr = 3.5e-3 #edm2_learning_rate_schedule(cur_nimg, **lr_scheduler)
+        cur_beta2 = 0.99 #cosine_decay_with_warmup(cur_nimg, **beta2_scheduler)
+        cur_gamma = 4 #cosine_decay_with_warmup(cur_nimg, **gamma_scheduler)
         cur_aug_p = cosine_decay_with_warmup(cur_nimg, **aug_scheduler)
         
         if augment_pipe is not None:

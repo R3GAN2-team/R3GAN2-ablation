@@ -16,41 +16,6 @@ from .MagnitudePreservingLayers import (
 )
 
 
-def ToChannelsLast(x):
-    if x is not None and x.ndim == 4:
-        return x.contiguous(memory_format=torch.channels_last)
-    return x
-
-
-def ToNCHWContiguous(x):
-    if x is not None and x.ndim == 4:
-        return x.contiguous()
-    return x
-
-
-class UnscaledLeakyReLU(nn.Module):
-    """LeakyReLU without the magnitude-preserving gain in forward().
-
-    The gain is folded into the following linear/convolutional layer inside
-    FeedForwardNetwork.  This is mathematically equivalent to the old scaled
-    LeakyReLU FFN, but in BF16 it may differ slightly because the gain is rounded
-    at a different point in the computation.
-    """
-    def __init__(self, α=0.2):
-        super(UnscaledLeakyReLU, self).__init__()
-
-        self.α = α
-        self.Gain = 1 / math.sqrt(((1 + α ** 2) - (1 - α) ** 2 / math.pi) / 2)
-
-    def forward(self, x):
-        return F.leaky_relu(x, negative_slope=self.α, inplace=True)
-
-    def Slope(self, x):
-        pos = torch.full((), 1.0, dtype=x.dtype, device=x.device)
-        neg = torch.full((), self.α, dtype=x.dtype, device=x.device)
-        return torch.where(x >= 0, pos, neg)
-
-
 class FeedForwardNetwork(nn.Module):
     def __init__(self, FirstConvolutionType, InputChannels, HiddenChannels, ChannelsPerGroup, KernelSize):
         super(FeedForwardNetwork, self).__init__()
@@ -58,16 +23,14 @@ class FeedForwardNetwork(nn.Module):
         self.LinearLayer1 = FirstConvolutionType(InputChannels, HiddenChannels, Centered=True)
         self.LinearLayer2 = Convolution(HiddenChannels, HiddenChannels, KernelSize=KernelSize, Groups=HiddenChannels // ChannelsPerGroup, Centered=True)
         self.LinearLayer3 = Convolution(HiddenChannels, InputChannels, KernelSize=1, Centered=True)
-        self.NonLinearity = UnscaledLeakyReLU()
+        self.NonLinearity = LeakyReLU()
 
     def forward(self, x, InputGain, ResidualGain):
         y = self.LinearLayer1(x, Gain=InputGain.view(1, -1, 1, 1))
-        y = self.LinearLayer2(self.NonLinearity(y), Gain=self.NonLinearity.Gain)
-        y = self.LinearLayer3(self.NonLinearity(y), Gain=self.NonLinearity.Gain * ResidualGain.view(-1, 1, 1, 1))
+        y = self.LinearLayer2(self.NonLinearity(y))
+        y = self.LinearLayer3(self.NonLinearity(y), Gain=ResidualGain.view(-1, 1, 1, 1))
 
-        # Do not mutate x: LinearLayer1 backward needs the original input.
-        # Mutating the branch output is safe because AddBackward does not need y.
-        return y.add_(x)
+        return x + y
 
     # ---------------------------------------------------------------------
     # Helpers for explicit R1/VJP. These are intentionally not used by the
@@ -84,28 +47,28 @@ class FeedForwardNetwork(nn.Module):
         raise TypeError(f'{type(layer).__name__} does not expose an effective pointwise weight/bias helper')
 
     def forward_with_cache(self, x, InputGain, ResidualGain):
-        """Run forward() while caching tensors needed by explicit_vjp().
-
-        Only cache tensors needed by explicit_vjp or already retained by the
-        ordinary autograd graph.  Because NonLinearity is in-place, y1/y2 are
-        post-activation tensors by the time explicit_vjp reads them; this is OK
-        for LeakyReLU with α > 0 because sign is preserved.
-        """
+        """Run forward() while caching tensors needed by explicit_vjp()."""
         input_gain = InputGain.view(1, -1, 1, 1)
         residual_gain = ResidualGain.view(-1, 1, 1, 1)
 
         y1 = self.LinearLayer1(x, Gain=input_gain)
         a1 = self.NonLinearity(y1)
-        y2 = self.LinearLayer2(a1, Gain=self.NonLinearity.Gain)
+        y2 = self.LinearLayer2(a1)
         a2 = self.NonLinearity(y2)
-        y3 = self.LinearLayer3(a2, Gain=self.NonLinearity.Gain * residual_gain)
-        # Do not mutate x; mutate branch output instead.
-        out = y3.add_(x)
+        y3 = self.LinearLayer3(a2, Gain=residual_gain)
+        out = x + y3
 
         cache = dict(
             Layer=self,
+            x=x,
             y1=y1,
+            a1=a1,
             y2=y2,
+            a2=a2,
+            y3=y3,
+            out=out,
+            InputGain=InputGain,
+            ResidualGain=ResidualGain,
             input_gain=input_gain,
             residual_gain=residual_gain,
         )
@@ -126,14 +89,14 @@ class FeedForwardNetwork(nn.Module):
         v = v_out
 
         # LinearLayer3: [hidden -> input] 1x1 convolution.
-        w3 = self.LinearLayer3.EffectiveWeight(dtype, Gain=self.NonLinearity.Gain * cache['residual_gain'])
+        w3 = self.LinearLayer3.EffectiveWeight(dtype, Gain=cache['residual_gain'])
         v = F.conv_transpose2d(v, w3, padding=self.LinearLayer3.Padding(w3), groups=self.LinearLayer3.Groups)
 
         # Activation 2.
         v = v * self.NonLinearity.Slope(cache['y2']).to(dtype)
 
         # LinearLayer2: grouped 3x3 convolution.
-        w2 = self.LinearLayer2.EffectiveWeight(dtype, Gain=self.NonLinearity.Gain)
+        w2 = self.LinearLayer2.EffectiveWeight(dtype)
         v = F.conv_transpose2d(v, w2, padding=self.LinearLayer2.Padding(w2), groups=self.LinearLayer2.Groups)
 
         # Activation 1.
@@ -144,7 +107,7 @@ class FeedForwardNetwork(nn.Module):
         v = F.conv_transpose2d(v, w1)
 
         v_x = v_x + v
-        if KeepInputDependency and 'x' in cache:
+        if KeepInputDependency:
             v_x = v_x + cache['x'] * 0
         return v_x
 
@@ -205,6 +168,14 @@ class ResidualGroup(nn.Module):
             InputGain = torch.rsqrt(AccumulatedVariance)
             x, Cache = Layer.forward_with_cache(x, InputGain=InputGain, ResidualGain=Alpha)
             NewAccumulatedVariance = AccumulatedVariance + Alpha * Alpha
+            Cache.update(dict(
+                BlockIndex=BlockIndex,
+                Alpha=Alpha,
+                AccumulatedVariance=AccumulatedVariance,
+                NewAccumulatedVariance=NewAccumulatedVariance,
+                InputGain=InputGain,
+                ResidualGain=Alpha,
+            ))
             Caches.append(Cache)
             AccumulatedVariance = NewAccumulatedVariance
 
@@ -422,22 +393,13 @@ class Generator(nn.Module):
 
     def forward(self, x, y=None):
         x = torch.cat([x, self.EmbeddingLayer(y)], dim=1) if hasattr(self, 'EmbeddingLayer') else x
-
-        # Generator head is the NCHW island.
-        x = ToNCHWContiguous(self.Head(x).to(torch.bfloat16))
-
-        # Everything after the head runs NHWC/channels-last, including
-        # residual groups, resampling transitions, and aggregation.
-        x = ToChannelsLast(x)
+        x = self.Head(x).to(torch.bfloat16)
 
         for Layer, Transition in zip(self.MainLayers[:-1], self.TransitionLayers):
             x, AccumulatedVariance = Layer(x)
             x = Transition(x, Gain=torch.rsqrt(AccumulatedVariance))
-            x = ToChannelsLast(x)
-
         x, AccumulatedVariance = self.MainLayers[-1](x)
 
-        x = ToChannelsLast(x)
         return self.AggregationLayer(x, Gain=self.Gain * torch.rsqrt(AccumulatedVariance).view(1, -1, 1, 1))
 
     def CompileMainLayers(self, mode='default', fullgraph=False, dynamic=False):
@@ -469,22 +431,13 @@ class Discriminator(nn.Module):
     def forward(self, x, y=None):
         if hasattr(self, 'EmbeddingLayer'):
             y = self.EmbeddingLayer(y)
+        x = self.ExtractionLayer(x.to(torch.bfloat16))
 
-        # Extraction also runs NHWC/channels-last.
-        x = ToChannelsLast(x.to(torch.bfloat16))
-        x = self.ExtractionLayer(x)
-        x = ToChannelsLast(x)
-
-        # Residual groups and downsample transitions run NHWC/channels-last.
         for Layer, Transition in zip(self.MainLayers[:-1], self.TransitionLayers):
             x, AccumulatedVariance = Layer(x)
             x = Transition(x, Gain=torch.rsqrt(AccumulatedVariance))
-            x = ToChannelsLast(x)
-
         x, AccumulatedVariance = self.MainLayers[-1](x)
 
-        # Discriminator head/resampler/basis is the NCHW island.
-        x = ToNCHWContiguous(x)
         x = self.Head(x.to(torch.float32), Gain=torch.rsqrt(AccumulatedVariance))
         x = (x * y / math.sqrt(y.shape[1])).sum(dim=1, keepdim=True) if hasattr(self, 'EmbeddingLayer') else x
 
@@ -500,9 +453,7 @@ class Discriminator(nn.Module):
 
     def ForwardToStage0(self, x, y=None):
         y = self.EmbedConditions(y)
-        x = ToChannelsLast(x.to(torch.bfloat16))
-        x = self.ExtractionLayer(x)
-        x = ToChannelsLast(x)
+        x = self.ExtractionLayer(x.to(torch.bfloat16))
         return x, y
 
     def ForwardStage0WithCache(self, x):
@@ -516,10 +467,7 @@ class Discriminator(nn.Module):
         and for wrappers/tests.
         """
         for Index in range(StageIndex, len(self.TransitionLayers)):
-            # Transition/downsample also runs NHWC/channels-last.
             x = self.TransitionLayers[Index](x, Gain=torch.rsqrt(AccumulatedVariance))
-            x = ToChannelsLast(x)
-
             Layer = self.MainLayers[Index + 1]
             if UseCompiled:
                 x, AccumulatedVariance = Layer(x)
@@ -529,8 +477,6 @@ class Discriminator(nn.Module):
                 else:
                     x, AccumulatedVariance = Layer(x)
 
-        # Head island is NCHW.
-        x = ToNCHWContiguous(x)
         x = self.Head(x.to(torch.float32), Gain=torch.rsqrt(AccumulatedVariance))
         x = (x * y / math.sqrt(y.shape[1])).sum(dim=1, keepdim=True) if hasattr(self, 'EmbeddingLayer') else x
         return x.view(x.shape[0])
@@ -565,11 +511,6 @@ class Discriminator(nn.Module):
             OutputDType = RealSamples.dtype
         if OutputDType is not None:
             gx = gx.to(OutputDType)
-        if RealSamples is not None and gx.ndim == 4 and RealSamples.ndim == 4:
-            if RealSamples.is_contiguous(memory_format=torch.channels_last):
-                gx = gx.contiguous(memory_format=torch.channels_last)
-            elif RealSamples.is_contiguous():
-                gx = gx.contiguous()
         if KeepInputDependency and RealSamples is not None:
             gx = gx + RealSamples * 0
         return gx
@@ -578,8 +519,7 @@ class Discriminator(nn.Module):
         """Run all residual stages plus head with caches for explicit VJP.
 
         Input x is expected to be after ExtractionLayer. y is expected to be
-        already embedded by ForwardToStage0().  Everything except the final
-        discriminator head runs NHWC/channels-last.
+        already embedded by ForwardToStage0().
         """
         StageOutputs = []
         StageCaches = []
@@ -587,19 +527,15 @@ class Discriminator(nn.Module):
         AccumulatedVariances = []
 
         # Stage 0.
-        x = ToChannelsLast(x)
         x, AccumulatedVariance, Caches = self.MainLayers[0].forward_with_cache(x)
         StageOutputs.append(x)
         StageCaches.append(Caches)
         AccumulatedVariances.append(AccumulatedVariance)
 
-        # Transitions + later residual stages. Resamplers support channels-last,
-        # so do not bounce through NCHW here.
+        # Transitions + later residual stages.
         for Index, Transition in enumerate(self.TransitionLayers):
             TransitionGain = torch.rsqrt(AccumulatedVariance)
-
             x, TransitionCache = Transition.forward_with_cache(x, Gain=TransitionGain)
-            x = ToChannelsLast(x)
             TransitionCaches.append(TransitionCache)
 
             x, AccumulatedVariance, Caches = self.MainLayers[Index + 1].forward_with_cache(x)
@@ -607,10 +543,9 @@ class Discriminator(nn.Module):
             StageCaches.append(Caches)
             AccumulatedVariances.append(AccumulatedVariance)
 
-        # Head is the NCHW island.
-        HeadInput = ToNCHWContiguous(x)
+        # Head with cache.
         HeadOut, HeadCache = self.Head.forward_with_cache(
-            HeadInput.to(torch.float32),
+            x.to(torch.float32),
             Gain=torch.rsqrt(AccumulatedVariance),
         )
 
@@ -669,9 +604,7 @@ class Discriminator(nn.Module):
 
         # Walk backward through transition + previous residual stage.
         for Index in reversed(range(len(self.TransitionLayers))):
-            # Transitions also run NHWC/channels-last.
             v = self.TransitionLayers[Index].explicit_vjp(v, TransitionCaches[Index])
-            v = ToChannelsLast(v)
             v = self.MainLayers[Index].explicit_vjp_from_cache(
                 v,
                 StageCaches[Index],

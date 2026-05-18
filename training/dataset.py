@@ -239,3 +239,63 @@ class ImageFolderDataset(Dataset):
         return labels
 
 #----------------------------------------------------------------------------
+
+class MMapLatentDataset(Dataset):
+    def __init__(self,
+        path,                   # Path to mmap latent dataset directory.
+        resolution      = None, # Optional resolution check.
+        **super_kwargs,         # Additional arguments for Dataset base class.
+    ):
+        self._path = path
+        self._images = None
+        self._raw_labels = None
+
+        meta_path = os.path.join(path, 'metadata.json')
+        if not os.path.isfile(meta_path):
+            raise IOError(f'Missing metadata.json in mmap latent dataset: {path}')
+
+        with open(meta_path, 'r') as f:
+            self._meta = json.load(f)
+
+        if self._meta.get('format') != 'r3gan_latent_mmap_v1':
+            raise IOError(f'Not an r3gan mmap latent dataset: {path}')
+
+        self._images_path = os.path.join(path, self._meta['images'])
+        self._labels_path = (
+            os.path.join(path, self._meta['labels'])
+            if self._meta.get('labels') is not None else None
+        )
+
+        raw_shape = list(self._meta['shape'])  # [N, C, H, W]
+        if resolution is not None and (raw_shape[2] != resolution or raw_shape[3] != resolution):
+            raise IOError('MMap latent dataset does not match the specified resolution')
+
+        name = os.path.basename(os.path.abspath(path))
+        super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
+
+    def _get_images(self):
+        if self._images is None:
+            self._images = np.memmap(
+                self._images_path,
+                mode='r',
+                dtype=np.dtype(self._meta['dtype']),
+                shape=tuple(self._meta['shape']),
+            )
+        return self._images
+
+    def _load_raw_image(self, raw_idx):
+        # Return a normal ndarray copy because Dataset.__getitem__ may xflip and
+        # the DataLoader should own the returned sample safely.
+        return np.asarray(self._get_images()[raw_idx]).copy()
+
+    def _load_raw_labels(self):
+        if self._labels_path is None:
+            return None
+        # mmap_mode keeps labels cheap and avoids loading a giant label array per worker.
+        return np.load(self._labels_path, mmap_mode='r')
+
+    def close(self):
+        self._images = None
+
+    def __getstate__(self):
+        return dict(super().__getstate__(), _images=None)

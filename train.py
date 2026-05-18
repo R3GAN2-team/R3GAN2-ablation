@@ -96,16 +96,46 @@ def launch_training(c, desc, outdir, dry_run):
 
 #----------------------------------------------------------------------------
 
+        
 def init_dataset_kwargs(data):
     try:
-        dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
-        dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # Subclass of training.dataset.Dataset.
-        dataset_kwargs.resolution = dataset_obj.resolution # Be explicit about resolution.
-        dataset_kwargs.use_labels = dataset_obj.has_labels # Be explicit about labels.
-        dataset_kwargs.max_size = len(dataset_obj) # Be explicit about dataset size.
+        # Fast path: contiguous mmap latent dataset created by latent_zip_to_mmap.py.
+        meta_path = os.path.join(data, 'metadata.json') if os.path.isdir(data) else None
+        if meta_path is not None and os.path.isfile(meta_path):
+            with open(meta_path, 'r') as f:
+                meta = json.load(f)
+
+            if meta.get('format') == 'r3gan_latent_mmap_v1':
+                dataset_kwargs = dnnlib.EasyDict(
+                    class_name='training.dataset.MMapLatentDataset',
+                    path=data,
+                    use_labels=True,
+                    max_size=None,
+                    xflip=False,
+                )
+                dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)
+                dataset_kwargs.resolution = dataset_obj.resolution
+                dataset_kwargs.use_labels = dataset_obj.has_labels
+                dataset_kwargs.max_size = len(dataset_obj)
+                return dataset_kwargs, dataset_obj.name
+
+        # Original StyleGAN/NVIDIA image-folder/zip path.
+        dataset_kwargs = dnnlib.EasyDict(
+            class_name='training.dataset.ImageFolderDataset',
+            path=data,
+            use_labels=True,
+            max_size=None,
+            xflip=False,
+        )
+        dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)
+        dataset_kwargs.resolution = dataset_obj.resolution
+        dataset_kwargs.use_labels = dataset_obj.has_labels
+        dataset_kwargs.max_size = len(dataset_obj)
         return dataset_kwargs, dataset_obj.name
+
     except IOError as err:
-        raise click.ClickException(f'--data: {err}')
+        raise click.ClickException(f'--data: {err}')        
+        
 
 #----------------------------------------------------------------------------
 

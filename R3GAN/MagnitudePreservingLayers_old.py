@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-
+from torch_utils.ops import bias_act
 
 def Normalize(x, Dimensions=None, ε=1e-4):
     if Dimensions is None:
@@ -9,202 +9,128 @@ def Normalize(x, Dimensions=None, ε=1e-4):
     Norm = torch.linalg.vector_norm(x, dim=Dimensions, keepdim=True, dtype=torch.float32)
     Norm = torch.add(ε, Norm, alpha=math.sqrt(Norm.numel() / x.numel()))
     return x / Norm.to(x.dtype)
-
-
+    
 class LeakyReLU(nn.Module):
     def __init__(self, α=0.2):
         super(LeakyReLU, self).__init__()
-
+        
         self.α = α
         self.Gain = 1 / math.sqrt(((1 + α ** 2) - (1 - α) ** 2 / math.pi) / 2)
 
     def forward(self, x):
-        return self.Gain * nn.functional.leaky_relu(x, negative_slope=self.α, inplace=True)
-
-    def Slope(self, x):
-        """Derivative of this activation wrt its input, away from x == 0.
-
-        This helper is for explicit R1/VJP code.  It deliberately mirrors the
-        forward: y = Gain * lrelu(x, α), so dy/dx is Gain for x >= 0 and
-        Gain * α for x < 0.  At x == 0, PyTorch/StyleGAN use the positive-side
-        convention for leaky ReLU in practice; using >= matches that convention.
-        """
-        pos = torch.full((), self.Gain, dtype=x.dtype, device=x.device)
-        neg = torch.full((), self.Gain * self.α, dtype=x.dtype, device=x.device)
-        return torch.where(x >= 0, pos, neg)
-
+        return bias_act.bias_act(x, None, act='lrelu', alpha=self.α, gain=self.Gain)
 
 class BoundedParameter(nn.Module):
     def __init__(self, Dimension, Bound=1):
         super(BoundedParameter, self).__init__()
-
+        
         self.Value = nn.Parameter(torch.zeros(Dimension))
         self.Bound = Bound
-
+        
     def forward(self):
         return self.Bound * torch.tanh(self.Value / self.Bound)
-
 
 class NormalizedWeight(nn.Module):
     def __init__(self, InputChannels, OutputChannels, Groups, KernelSize, Centered):
         super(NormalizedWeight, self).__init__()
-
+        
         self.Centered = Centered
         self.Weight = nn.Parameter(torch.randn(OutputChannels, InputChannels // Groups, *KernelSize))
-
+        
     def Evaluate(self, w):
         if self.Centered:
             w = w - torch.mean(w, axis=list(range(1, w.ndim)), keepdim=True)
         return Normalize(w)
-
+        
     def forward(self):
         return self.Evaluate(self.Weight.to(torch.float32))
-
+    
     def NormalizeWeight(self):
         self.Weight.copy_(self.Evaluate(self.Weight.detach()))
-
 
 class WeightNormalizedConvolution(nn.Module):
     def __init__(self, InputChannels, OutputChannels, Groups, EnablePadding, KernelSize, Centered):
         super(WeightNormalizedConvolution, self).__init__()
-
+        
         self.Groups = Groups
         self.EnablePadding = EnablePadding
         self.Weight = NormalizedWeight(InputChannels, OutputChannels, Groups, KernelSize, Centered)
 
-    def EffectiveWeight(self, DType=None, Gain=1):
-        """Return the effective weight tensor used by forward().
-
-        This is intentionally a differentiable helper: gradients still flow back
-        through centering/normalization into self.Weight.Weight.  DType controls
-        the final cast that forward() normally performs using x.dtype.  Passing
-        DType=None leaves the effective weight in float32.
-        """
+    def forward(self, x, Gain=1):
         w = self.Weight()
         w = w * (Gain / math.sqrt(w[0].numel()))
-        if DType is not None:
-            w = w.to(DType)
-        return w
-
-    def Padding(self, w=None):
-        if not self.EnablePadding:
-            return 0
-        if w is None:
-            # Works for all current convolutional uses.  Linear uses EnablePadding=False.
-            k = self.Weight.Weight.shape[-1]
-        else:
-            k = w.shape[-1]
-        return (k // 2,)
-
-    def forward(self, x, Gain=1):
-        w = self.EffectiveWeight(x.dtype, Gain=Gain)
+        w = w.to(x.dtype)
 
         if w.ndim == 2:
             return x @ w.t()
-        return nn.functional.conv2d(x, w, padding=self.Padding(w), groups=self.Groups)
-
-
+        return nn.functional.conv2d(x, w, padding=(w.shape[-1] // 2,) if self.EnablePadding else 0, groups=self.Groups)
+        
 def Convolution(InputChannels, OutputChannels, KernelSize, Groups=1, Centered=False):
     return WeightNormalizedConvolution(InputChannels, OutputChannels, Groups, True, [KernelSize, KernelSize], Centered)
-
 
 def Linear(InputDimension, OutputDimension, Centered=False):
     return WeightNormalizedConvolution(InputDimension, OutputDimension, 1, False, [], Centered)
 
-
 class BiasedPointwiseConvolution(nn.Module):
     def __init__(self, InputChannels, OutputChannels, Centered=False):
         super(BiasedPointwiseConvolution, self).__init__()
-
+        
         self.Weight = NormalizedWeight(InputChannels + 1, OutputChannels, 1, [1, 1], Centered)
-
-    def EffectiveWeightBias(self, DType=None, Gain=1):
-        """Return the effective (weight, bias) used by forward().
-
-        The returned tensors are differentiable wrt the raw normalized-weight
-        parameter.  This helper is for explicit VJP/R1 code and should match
-        forward() exactly.
-        """
+        
+    def forward(self, x, Gain=1):
         w = self.Weight()
         w = w / math.sqrt(w[0].numel())
         b = w[:, -1, :, :].view(-1)
         w = w[:, :-1, :, :] * Gain
-        if DType is not None:
-            w = w.to(DType)
-            b = b.to(DType)
-        return w, b
-
-    def forward(self, x, Gain=1):
-        w, b = self.EffectiveWeightBias(x.dtype, Gain=Gain)
-        return nn.functional.conv2d(x, w, b)
-
-
+        
+        return nn.functional.conv2d(x, w.to(x.dtype), b.to(x.dtype))
+    
 class BiasedPointwiseConvolutionWithNoiseInjection(nn.Module):
     def __init__(self, InputChannels, OutputChannels, Centered=False):
         super(BiasedPointwiseConvolutionWithNoiseInjection, self).__init__()
-
+        
         self.Weight = NormalizedWeight(InputChannels + 2, OutputChannels, 1, [1, 1], Centered)
-
-    def EffectiveWeightBiasNoiseScale(self, DType=None, Gain=1):
-        """Return the effective (weight, bias, noise_scale) used by forward()."""
+        
+    def forward(self, x, Gain=1):
         w = self.Weight()
         w = w / math.sqrt(w[0].numel())
         b = w[:, -1, :, :].view(-1)
         s = w[:, -2, :, :].view(-1)
         w = w[:, :-2, :, :] * Gain
-        if DType is not None:
-            w = w.to(DType)
-            b = b.to(DType)
-        return w, b, s
-
-    def forward(self, x, Gain=1):
-        w, b, s = self.EffectiveWeightBiasNoiseScale(x.dtype, Gain=Gain)
         n = torch.randn([x.shape[0], 1, x.shape[2], x.shape[3]], device=x.device)
-
-        return nn.functional.conv2d(x, w, b).addcmul_(n, s.view(1, -1, 1, 1))
-
+        
+        return nn.functional.conv2d(x, w.to(x.dtype), b.to(x.dtype)).add_(n * s.view(1, -1, 1, 1))
 
 class GenerativeBasis(nn.Module):
     def __init__(self, OutputChannels, ChannelsPerGroup):
         super(GenerativeBasis, self).__init__()
-
+        
         self.Basis = NormalizedWeight(OutputChannels, OutputChannels, OutputChannels // ChannelsPerGroup, [4, 4], True)
         self.ChannelsPerGroup = ChannelsPerGroup
-
-    def EffectiveBasis(self):
-        return self.Basis()
-
+        
     def forward(self, x):
-        w = self.EffectiveBasis()
+        w = self.Basis()
         x = x.view(x.shape[0], -1, self.ChannelsPerGroup)
         w = w.view(x.shape[1], -1, *w.shape[1:]) / math.sqrt(x.shape[-1])
         x = torch.einsum('ngc,gochw->ngohw', x, w).contiguous()
-
+        
         return x.view(x.shape[0], -1, *x.shape[3:])
-
 
 class DiscriminativeBasis(nn.Module):
     def __init__(self, InputChannels, ChannelsPerGroup):
         super(DiscriminativeBasis, self).__init__()
-
+        
         self.Basis = WeightNormalizedConvolution(InputChannels, InputChannels, InputChannels // ChannelsPerGroup, False, [4, 4], True)
-
+        
     def forward(self, x):
         return self.Basis(x).view(x.shape[0], -1)
-
-
+    
 class ClassEmbedder(nn.Module):
     def __init__(self, NumberOfClasses, EmbeddingDimension):
         super(ClassEmbedder, self).__init__()
-
+        
         self.Weight = NormalizedWeight(EmbeddingDimension, NumberOfClasses, 1, [], True)
         self.Weight.Weight.data.copy_(NormalizedWeight(EmbeddingDimension, 1, 1, [], True)().repeat(NumberOfClasses, 1))
-
-    def EffectiveWeight(self, DType=None):
-        w = self.Weight()
-        if DType is not None:
-            w = w.to(DType)
-        return w
-
+    
     def forward(self, x):
-        return x @ self.EffectiveWeight(x.dtype)
+        return x @ self.Weight().to(x.dtype)
