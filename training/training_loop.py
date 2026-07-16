@@ -10,6 +10,8 @@
 
 import os
 import time
+import glob
+import re
 import copy
 import json
 import pickle
@@ -27,26 +29,97 @@ import legacy
 from metrics import metric_main
 from .feat_collector import CollectGeneratorFeatures, CollectDiscriminatorFeatures, CollectMagnitude
 
-def cosine_decay_with_warmup(cur_nimg, base_value, total_nimg, final_value=0.0, warmup_value=0.0, warmup_nimg=0, hold_base_value_nimg=0):
-    decay = 0.5 * (1 + np.cos(np.pi * (cur_nimg - warmup_nimg - hold_base_value_nimg) / float(total_nimg - warmup_nimg - hold_base_value_nimg)))
-    cur_value = base_value + (1 - decay) * (final_value - base_value)
-    if hold_base_value_nimg > 0:
-        cur_value = np.where(cur_nimg > warmup_nimg + hold_base_value_nimg, cur_value, base_value)
-    if warmup_nimg > 0:
-        slope = (base_value - warmup_value) / warmup_nimg
-        warmup_v = slope * cur_nimg + warmup_value
-        cur_value = np.where(cur_nimg < warmup_nimg, warmup_v, cur_value)
-    return float(np.where(cur_nimg > total_nimg, final_value, cur_value))
+def linear_schedule(cur_nimg, base_value, total_nimg, final_value, rampup_Mimg=0):
+    rampup_nimg = rampup_Mimg * 1e6
+
+    if cur_nimg >= total_nimg:
+        return final_value
+    if cur_nimg <= rampup_nimg:
+        return base_value
+
+    t = (cur_nimg - rampup_nimg) / (total_nimg - rampup_nimg)
+    return base_value + t * (final_value - base_value)
+
+
+def log_linear_schedule(cur_nimg, base_value, total_nimg, final_value, rampup_Mimg=0):
+    rampup_nimg = rampup_Mimg * 1e6
+
+    if cur_nimg >= total_nimg:
+        return final_value
+    if cur_nimg <= rampup_nimg:
+        return base_value
+
+    t = (cur_nimg - rampup_nimg) / (total_nimg - rampup_nimg)
+    return base_value * (final_value / base_value) ** t
+
+
+def beta2_from_exact_horizon_schedule(
+    cur_nimg,
+    total_nimg,
+    start_beta2=0.9,
+    final_beta2=0.99,
+    rampup_Mimg=0,
+):
+    rampup_nimg = rampup_Mimg * 1e6
+
+    if cur_nimg >= total_nimg:
+        return final_beta2
+    if cur_nimg <= rampup_nimg:
+        return start_beta2
+
+    start_tau = -1.0 / np.log(start_beta2)
+    final_tau = -1.0 / np.log(final_beta2)
+
+    tau = log_linear_schedule(
+        cur_nimg=cur_nimg,
+        base_value=start_tau,
+        total_nimg=total_nimg,
+        final_value=final_tau,
+        rampup_Mimg=rampup_Mimg,
+    )
+
+    return float(np.exp(-1.0 / tau))
 
 #----------------------------------------------------------------------------
 
-def edm2_learning_rate_schedule(cur_nimg, batch_size, ref_lr, ref_batches, rampup_Mimg):
-    lr = ref_lr
-    if ref_batches > 0:
-        lr /= np.sqrt(max(cur_nimg / (ref_batches * batch_size), 1))
-    if rampup_Mimg > 0:
-        lr *= min(cur_nimg / (rampup_Mimg * 1e6), 1)
-    return lr
+def edm2_power_bridge_learning_rate_schedule(
+    cur_nimg,
+    batch_size,
+    max_lr,
+    ref_lr,
+    ref_batches,
+    rampup_Mimg,
+    total_nimg,
+    early_decay_mult=5.0,
+):
+    warmup_nimg = rampup_Mimg * 1e6
+    decay_ref_nimg = ref_batches * batch_size
+
+    # Stage 1: linear warmup, 0 -> max_lr.
+    if cur_nimg < warmup_nimg:
+        return float(max_lr * (cur_nimg / warmup_nimg))
+
+    # Stage 3: shifted 1/sqrt tail, starting exactly at total_nimg.
+    if cur_nimg >= total_nimg:
+        x = cur_nimg - total_nimg
+        return float(ref_lr / np.sqrt(1.0 + x / decay_ref_nimg))
+
+    # Stage 2: monotone power bridge, max_lr -> ref_lr.
+    bridge_nimg = total_nimg - warmup_nimg
+    delta = max_lr - ref_lr
+
+    u = (cur_nimg - warmup_nimg) / bridge_nimg
+    v = 1.0 - u
+
+    # Match the derivative of the sqrt tail at total_nimg.
+    s = ref_lr * bridge_nimg / (2.0 * decay_ref_nimg * delta)
+
+    # Set the initial bridge decay speed.
+    # early_decay_mult = 5 means initial bridge slope is 5x the average slope.
+    a = (early_decay_mult - 1.0) / (1.0 - s)
+
+    lr = ref_lr + delta * v * (s + (1.0 - s) * v**a)
+    return float(lr)
 
 #----------------------------------------------------------------------------
 
@@ -124,6 +197,383 @@ def remap_optimizer_state_dict(state_dict, device):
                         subparam._grad.data = subparam._grad.data.to(device)
     return state_dict
 
+
+#----------------------------------------------------------------------------
+
+def _snapshot_kimg(path):
+    m = re.search(r'network-snapshot-(\d+)\.pkl$', os.path.basename(path))
+    return int(m.group(1)) if m is not None else -1
+
+#----------------------------------------------------------------------------
+
+def _fsync_dir(path):
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+#----------------------------------------------------------------------------
+
+def atomic_pickle_dump(obj, final_path):
+    tmp_path = f'{final_path}.tmp.{os.getpid()}'
+    try:
+        with open(tmp_path, 'wb') as f:
+            pickle.dump(obj, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, final_path)
+        _fsync_dir(os.path.dirname(final_path))
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+#----------------------------------------------------------------------------
+
+def _remove_file(path, reason):
+    try:
+        os.remove(path)
+        print(f'WARNING: deleted {reason}: {path}', flush=True)
+    except FileNotFoundError:
+        pass
+
+#----------------------------------------------------------------------------
+
+def _load_network_snapshot_for_cleanup(path):
+    try:
+        with open(path, 'rb') as f:
+            data = legacy.load_network_pkl(f)
+        for key in ['G', 'D', 'cur_nimg', 'G_opt_state', 'D_opt_state']:
+            if key not in data:
+                raise KeyError(f'missing key {key}')
+        return data
+    except Exception as err:
+        print(f'WARNING: corrupted network snapshot: {path} ({type(err).__name__}: {err})', flush=True)
+        return None
+
+#----------------------------------------------------------------------------
+
+def _validate_ema_snapshot(path):
+    try:
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        if not hasattr(data, 'ema') and not (isinstance(data, dict) and 'ema' in data):
+            raise KeyError('missing key ema')
+        return True
+    except Exception as err:
+        print(f'WARNING: corrupted EMA snapshot: {path} ({type(err).__name__}: {err})', flush=True)
+        return False
+
+#----------------------------------------------------------------------------
+
+def _expected_ema_suffixes(ema_kwargs):
+    stds = [] if ema_kwargs is None else list(ema_kwargs.get('stds', []))
+    return {f'-{float(std):.5f}' for std in stds}
+
+#----------------------------------------------------------------------------
+
+def _is_url_path(path):
+    return re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', str(path)) is not None
+
+#----------------------------------------------------------------------------
+
+def _cleanup_atomic_tmp_files(run_dir):
+    for subdir in ['snapshots', 'ema']:
+        root = os.path.join(run_dir, subdir)
+        for path in glob.glob(os.path.join(root, '*.tmp.*')):
+            _remove_file(path, 'stale atomic-write temp file')
+
+#----------------------------------------------------------------------------
+
+def _cleanup_latest_network_snapshot(run_dir):
+    # Check only the current tail of the network-snapshot stream. If the newest
+    # snapshot is corrupt, delete it and try the next newest candidate until the
+    # latest remaining snapshot is loadable. This avoids scanning the whole run
+    # history on every resume while still recovering from interrupted writes.
+    snapshot_dir = os.path.join(run_dir, 'snapshots')
+    while True:
+        paths = sorted(glob.glob(os.path.join(snapshot_dir, 'network-snapshot-*.pkl')), key=_snapshot_kimg, reverse=True)
+        if len(paths) == 0:
+            return None, None
+        path = paths[0]
+        data = _load_network_snapshot_for_cleanup(path)
+        if data is not None:
+            return path, data
+        _remove_file(path, 'corrupted latest network snapshot')
+
+#----------------------------------------------------------------------------
+
+def _parse_ema_snapshot_path(path):
+    m = re.match(r'^ema-snapshot-(\d+)(.*)\.pkl$', os.path.basename(path))
+    if m is None:
+        return None
+    return int(m.group(1)), m.group(1), m.group(2)
+
+#----------------------------------------------------------------------------
+
+def _list_ema_snapshot_groups(run_dir):
+    ema_dir = os.path.join(run_dir, 'ema')
+    groups = dict()
+    for path in glob.glob(os.path.join(ema_dir, 'ema-snapshot-*.pkl')):
+        parsed = _parse_ema_snapshot_path(path)
+        if parsed is None:
+            continue
+        kimg_int, kimg_str, suffix = parsed
+        groups.setdefault(kimg_int, (kimg_str, dict()))[1][suffix] = path
+    return groups
+
+#----------------------------------------------------------------------------
+
+def _remove_ema_snapshot_group(kimg, suffix_to_path, reason):
+    for path in sorted(suffix_to_path.values()):
+        _remove_file(path, f'{reason} EMA snapshot group {kimg}')
+
+#----------------------------------------------------------------------------
+
+def _validate_ema_snapshot_group(kimg, suffix_to_path, ema_kwargs):
+    # EMA groups are atomic for EDM2 compatibility: all expected std files for a
+    # kimg must exist and be loadable. If the expected suffix set is known, any
+    # missing or unexpected file invalidates the whole group.
+    expected_suffixes = _expected_ema_suffixes(ema_kwargs)
+    if len(expected_suffixes) > 0:
+        found_suffixes = set(suffix_to_path.keys())
+        if found_suffixes != expected_suffixes:
+            missing = sorted(expected_suffixes - found_suffixes)
+            unexpected = sorted(found_suffixes - expected_suffixes)
+            print(
+                f'WARNING: incomplete EMA snapshot group {kimg}: '
+                f'missing={missing}, unexpected={unexpected}',
+                flush=True,
+            )
+            return False
+
+    for path in sorted(suffix_to_path.values()):
+        if not _validate_ema_snapshot(path):
+            return False
+    return True
+
+#----------------------------------------------------------------------------
+
+def _cleanup_ema_groups_after_kimg(run_dir, max_kimg):
+    # EMA groups newer than the selected network checkpoint belong to a future
+    # branch that will be rolled back on resume, even if each EMA file is valid.
+    groups = _list_ema_snapshot_groups(run_dir)
+    for kimg_int, (kimg, suffix_to_path) in sorted(groups.items()):
+        if kimg_int > max_kimg:
+            print(
+                f'WARNING: EMA snapshot group {kimg} is newer than latest valid network snapshot {max_kimg:09d}; deleting it.',
+                flush=True,
+            )
+            _remove_ema_snapshot_group(kimg, suffix_to_path, 'future')
+
+#----------------------------------------------------------------------------
+
+def _cleanup_tail_ema_snapshot_groups(run_dir, ema_kwargs, max_kimg):
+    # Check only the current EMA tail at or before max_kimg. If it is invalid,
+    # delete that tail group and repeat, so stale/corrupted tail groups are
+    # peeled off without scanning the entire history.
+    while True:
+        groups = {k: v for k, v in _list_ema_snapshot_groups(run_dir).items() if k <= max_kimg}
+        if len(groups) == 0:
+            return None
+
+        kimg_int, (kimg, suffix_to_path) = max(groups.items(), key=lambda item: item[0])
+        if _validate_ema_snapshot_group(kimg, suffix_to_path, ema_kwargs):
+            return kimg_int, kimg, suffix_to_path
+
+        _remove_ema_snapshot_group(kimg, suffix_to_path, 'corrupted latest')
+
+#----------------------------------------------------------------------------
+
+def _network_snapshot_requires_ema_group(snapshot_data, ema_snapshot_ticks, total_kimg):
+    if ema_snapshot_ticks is None:
+        return False
+
+    saved_ema_snapshot_ticks = snapshot_data.get('ema_snapshot_ticks', ema_snapshot_ticks)
+    if saved_ema_snapshot_ticks is None:
+        return False
+
+    requires = False
+    if 'cur_tick' in snapshot_data:
+        requires = (int(snapshot_data['cur_tick']) % int(saved_ema_snapshot_ticks)) == 0
+
+    # New snapshots explicitly record whether they were saved by the terminal
+    # `done` path. Older snapshots did not, so fall back to the current total_kimg
+    # as a conservative best-effort detector.
+    if bool(snapshot_data.get('done', False)):
+        requires = True
+    elif total_kimg is not None and 'cur_nimg' in snapshot_data:
+        try:
+            requires = requires or (int(snapshot_data['cur_nimg']) >= int(total_kimg * 1000))
+        except Exception:
+            pass
+
+    return requires
+
+#----------------------------------------------------------------------------
+
+def cleanup_corrupt_resume_files(run_dir, ema_kwargs, ema_snapshot_ticks=None, total_kimg=None):
+    _cleanup_atomic_tmp_files(run_dir)
+
+    while True:
+        network_path, network_data = _cleanup_latest_network_snapshot(run_dir)
+        if network_path is None:
+            return
+
+        network_kimg = _snapshot_kimg(network_path)
+        _cleanup_ema_groups_after_kimg(run_dir, network_kimg)
+        latest_ema_group = _cleanup_tail_ema_snapshot_groups(run_dir, ema_kwargs, network_kimg)
+
+        if _network_snapshot_requires_ema_group(network_data, ema_snapshot_ticks, total_kimg):
+            if latest_ema_group is None or latest_ema_group[0] != network_kimg:
+                found = 'none' if latest_ema_group is None else latest_ema_group[1]
+                print(
+                    f'WARNING: network snapshot {network_kimg:09d} requires a complete EMA group at the same kimg, '
+                    f'but latest valid EMA group is {found}; deleting network snapshot and falling back.',
+                    flush=True,
+                )
+                _remove_file(network_path, 'network snapshot with missing required EMA group')
+                continue
+
+        return
+
+#----------------------------------------------------------------------------
+
+def find_latest_network_snapshot(run_dir):
+    snapshot_dir = os.path.join(run_dir, 'snapshots')
+    paths = glob.glob(os.path.join(snapshot_dir, 'network-snapshot-*.pkl'))
+    if len(paths) == 0:
+        raise FileNotFoundError(f'No network snapshots found in {snapshot_dir}')
+
+    return max(paths, key=_snapshot_kimg)
+
+#----------------------------------------------------------------------------
+
+def derive_next_tick_from_nimg(cur_nimg, batch_size, kimg_per_tick):
+    if cur_nimg <= 0:
+        return 0
+    tick_nimg = int(np.ceil((kimg_per_tick * 1000) / batch_size)) * batch_size
+    return int(1 + max(0, (cur_nimg - batch_size) // tick_nimg))
+
+#----------------------------------------------------------------------------
+
+def _stat_value(x):
+    if isinstance(x, dict):
+        if 'mean' in x:
+            return x['mean']
+        if 'value' in x:
+            return x['value']
+    if isinstance(x, (int, float)):
+        return x
+    return None
+
+#----------------------------------------------------------------------------
+
+def _read_last_total_sec(stats_path, max_kimg=None):
+    if not os.path.isfile(stats_path):
+        return 0.0
+
+    last = 0.0
+    with open(stats_path, 'rt') as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+
+            if max_kimg is not None:
+                kimg = _stat_value(obj.get('Progress/kimg'))
+                if kimg is not None and kimg > max_kimg + 1e-9:
+                    continue
+
+            total_sec = _stat_value(obj.get('Timing/total_sec'))
+            if total_sec is not None:
+                last = float(total_sec)
+    return last
+
+#----------------------------------------------------------------------------
+
+def _truncate_stats_jsonl_at_kimg(stats_path, max_kimg):
+    if not os.path.isfile(stats_path):
+        return
+
+    keep = []
+    with open(stats_path, 'rt') as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+                kimg = _stat_value(obj.get('Progress/kimg'))
+            except Exception:
+                keep.append(line)
+                continue
+
+            if kimg is None or kimg <= max_kimg + 1e-9:
+                keep.append(line)
+
+    with open(stats_path, 'wt') as f:
+        f.writelines(keep)
+
+#----------------------------------------------------------------------------
+
+def _parse_snapshot_kimg_from_path(path):
+    m = re.search(r'network-snapshot-(\d+)\.pkl', str(path))
+    return int(m.group(1)) if m is not None else None
+
+#----------------------------------------------------------------------------
+
+def _truncate_metric_jsonl_at_kimg(run_dir, max_kimg):
+    for path in glob.glob(os.path.join(run_dir, 'metric-*.jsonl')):
+        keep = []
+        with open(path, 'rt') as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                    kimg = _parse_snapshot_kimg_from_path(obj.get('snapshot_pkl', ''))
+                except Exception:
+                    keep.append(line)
+                    continue
+
+                if kimg is None or kimg <= max_kimg:
+                    keep.append(line)
+
+        with open(path, 'wt') as f:
+            f.writelines(keep)
+
+#----------------------------------------------------------------------------
+
+def load_and_increment_resume_count(run_dir, resume_run, rank, device, num_gpus):
+    if not resume_run:
+        resume_count = 0
+    elif rank == 0:
+        state_path = os.path.join(run_dir, 'resume_state.json')
+        if os.path.isfile(state_path):
+            with open(state_path, 'rt') as f:
+                state = json.load(f)
+            resume_count = int(state.get('resume_count', 0)) + 1
+        else:
+            resume_count = 1
+
+        tmp_path = state_path + '.tmp'
+        with open(tmp_path, 'wt') as f:
+            json.dump(dict(resume_count=resume_count), f, indent=2)
+            f.write('\n')
+        os.replace(tmp_path, state_path)
+    else:
+        resume_count = 0
+
+    if resume_run and num_gpus > 1:
+        value = torch.tensor([resume_count], device=device, dtype=torch.int64)
+        torch.distributed.broadcast(value, src=0)
+        resume_count = int(value.item())
+
+    return resume_count
+
 #----------------------------------------------------------------------------
 
 def training_loop(
@@ -155,6 +605,7 @@ def training_loop(
     network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
     ema_snapshot_ticks      = 50,
     resume_pkl              = None,     # Network pickle to resume training from.
+    resume_dir              = None,     # Existing run dir to resume in-place. If set, auto-load latest snapshot.
     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
     progress_fn             = None,     # Callback function for updating training progress. Called for all ranks.
@@ -165,8 +616,37 @@ def training_loop(
     # Initialize.
     start_time = time.time()
     device = torch.device('cuda', rank)
-    np.random.seed(random_seed * num_gpus + rank)
-    torch.manual_seed(random_seed * num_gpus + rank)
+    torch.cuda.set_device(device)
+
+    # Resolve in-place resume before seeding or constructing the sampler.
+    resume_run = resume_dir is not None
+    if resume_run:
+        run_dir = resume_dir
+        if rank == 0:
+            cleanup_corrupt_resume_files(run_dir, ema_kwargs, ema_snapshot_ticks=ema_snapshot_ticks, total_kimg=total_kimg)
+        if num_gpus > 1:
+            torch.distributed.barrier()
+        if resume_pkl is not None and (not _is_url_path(resume_pkl)) and (not os.path.exists(resume_pkl)):
+            resume_pkl = None
+        if resume_pkl is None:
+            resume_pkl = find_latest_network_snapshot(run_dir)
+        if rank == 0:
+            print(f'Resuming run directory: {run_dir}')
+            print(f'Auto-selected checkpoint: {resume_pkl}')
+
+    # Fresh runs use the original seed exactly. In-place resumed runs advance the
+    # stochastic streams with a persistent sidecar counter instead of replaying
+    # the same sampler/latent/augmentation prefix after every restart.
+    resume_count = load_and_increment_resume_count(
+        run_dir=run_dir,
+        resume_run=resume_run,
+        rank=rank,
+        device=device,
+        num_gpus=num_gpus,
+    )
+    effective_seed = random_seed + 1000003 * resume_count
+    np.random.seed(effective_seed * num_gpus + rank)
+    torch.manual_seed(effective_seed * num_gpus + rank)
     torch.backends.cudnn.benchmark = cudnn_benchmark    # Improves training speed.
     torch.backends.cuda.matmul.allow_tf32 = False       # Improves numerical accuracy.
     torch.backends.cudnn.allow_tf32 = False             # Improves numerical accuracy.
@@ -184,15 +664,19 @@ def training_loop(
     grid_sample_gradfix.enabled = True                  # Avoids errors with the augmentation pipe.
           
     if rank == 0:
-        os.mkdir(os.path.join(run_dir, 'ema'))
-        os.mkdir(os.path.join(run_dir, 'snapshots'))
+        if resume_run:
+            os.makedirs(os.path.join(run_dir, 'ema'), exist_ok=True)
+            os.makedirs(os.path.join(run_dir, 'snapshots'), exist_ok=True)
+        else:
+            os.mkdir(os.path.join(run_dir, 'ema'))
+            os.mkdir(os.path.join(run_dir, 'snapshots'))
 
     # Load training set.
     if rank == 0:
         print('Loading training set...')
     eval_set = dnnlib.util.construct_class_by_name(**eval_set_kwargs) # subclass of training.dataset.Dataset
     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs) # subclass of training.dataset.Dataset
-    training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
+    training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=effective_seed)
     training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, **data_loader_kwargs))
 
     if rank == 0:
@@ -225,18 +709,33 @@ def training_loop(
     ema = dnnlib.util.construct_class_by_name(net=G, **ema_kwargs)
     ema_preview = ema.emas[1]
 
+    from R3GAN.Networks import FeedForwardNetwork
+    from R3GAN.kernels.fused_ffn import install_fused_ffn, kernel_status
+    install_fused_ffn(FeedForwardNetwork, enable=True, vjp=True)
+
+    resume_data = None
+    cur_nimg = 0
+
     # Resume from existing pickle.
     if resume_pkl is not None:
         with dnnlib.util.open_url(resume_pkl) as f:
             resume_data = legacy.load_network_pkl(f)
+        cur_nimg = int(resume_data['cur_nimg'])
+        assert cur_nimg % batch_size == 0, (
+            f'Checkpoint cur_nimg={cur_nimg} is not divisible by current batch_size={batch_size}'
+        )
+        if 'batch_size' in resume_data:
+            assert int(resume_data['batch_size']) == int(batch_size), (
+                f'Checkpoint batch_size={resume_data["batch_size"]} != current batch_size={batch_size}'
+            )
         if rank == 0:
-            print(f'Resuming from "{resume_pkl}"')
+            print(f'Resuming from "{resume_pkl}" at {cur_nimg / 1e3:.1f} kimg')
             for name, module in [('G', G), ('D', D)]:
-                misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
+                misc.copy_params_and_buffers(resume_data[name], module, require_all=resume_run)
             ema.load_state_dict(resume_data)
 
     # Print network summary tables.
-    if rank == 0:
+    if rank == 0 and not resume_run:
         z = torch.empty([min(g_batch_gpu, d_batch_gpu), G.z_dim], device=device)
         c = torch.empty([min(g_batch_gpu, d_batch_gpu), G.c_dim], device=device)
         img = misc.print_module_summary(G, [z, c])
@@ -356,14 +855,17 @@ def training_loop(
     grid_size = None
     grid_z = None
     grid_c = None
-    if rank == 0:
+    if rank == 0 and False:
         print('Exporting sample images...')
         grid_size, images, labels = setup_snapshot_image_grid(training_set=eval_set)
-        save_image_grid(images, os.path.join(run_dir, 'reals.png'), grid_size=grid_size)
+        reals_path = os.path.join(run_dir, 'reals.png')
+        if (not resume_run) or (not os.path.isfile(reals_path)):
+            save_image_grid(images, reals_path, grid_size=grid_size)
         grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(g_batch_gpu)
         grid_c = torch.from_numpy(labels).to(device).split(g_batch_gpu)
-        images = torch.cat([encoder.decode(ema_preview(z, c)).cpu() for z, c in zip(grid_z, grid_c)]).to(torch.float).numpy()
-        save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), grid_size=grid_size)
+        if not resume_run:
+            images = torch.cat([encoder.decode(ema_preview(z, c)).cpu() for z, c in zip(grid_z, grid_c)]).to(torch.float).numpy()
+            save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), grid_size=grid_size)
 
     # Initialize logs.
     if rank == 0:
@@ -372,11 +874,23 @@ def training_loop(
     stats_metrics = dict()
     stats_jsonl = None
     stats_tfevents = None
+    resume_time_offset = 0.0
     if rank == 0:
-        stats_jsonl = open(os.path.join(run_dir, 'stats.jsonl'), 'wt')
+        stats_path = os.path.join(run_dir, 'stats.jsonl')
+        if resume_run:
+            resume_kimg = cur_nimg / 1e3
+            _truncate_stats_jsonl_at_kimg(stats_path, resume_kimg)
+            _truncate_metric_jsonl_at_kimg(run_dir, int(cur_nimg // 1000))
+            resume_time_offset = _read_last_total_sec(stats_path, max_kimg=resume_kimg)
+            stats_jsonl = open(stats_path, 'a')
+        else:
+            stats_jsonl = open(stats_path, 'wt')
         try:
             import torch.utils.tensorboard as tensorboard
-            stats_tfevents = tensorboard.SummaryWriter(run_dir)
+            if resume_run:
+                stats_tfevents = tensorboard.SummaryWriter(run_dir, purge_step=int(cur_nimg // 1000) + 1)
+            else:
+                stats_tfevents = tensorboard.SummaryWriter(run_dir)
         except ImportError as err:
             print('Skipping tfevents export:', err)
 
@@ -384,14 +898,17 @@ def training_loop(
     if rank == 0:
         print(f'Training for {total_kimg} kimg...')
         print()
-    cur_nimg = resume_data['cur_nimg'] if resume_pkl is not None else 0
-    cur_tick = 0
+    if (resume_pkl is not None) and resume_run:
+        cur_tick = int(resume_data.get('cur_tick_next', derive_next_tick_from_nimg(cur_nimg, batch_size, kimg_per_tick)))
+        batch_idx = cur_nimg // batch_size
+    else:
+        cur_tick = 0
+        batch_idx = 0
     tick_start_nimg = cur_nimg
     tick_start_time = time.time()
     maintenance_time = tick_start_time - start_time
-    batch_idx = 0
     if progress_fn is not None:
-        progress_fn(0, total_kimg)
+        progress_fn(cur_nimg // 1000, total_kimg)
         
     # Dummy Timing, required to fix phase shift
     for phase in phases:
@@ -425,10 +942,10 @@ def training_loop(
             all_real_c += [G_img_c.detach().clone().to(device).split(g_batch_gpu)]
             all_gen_z += [G_z.detach().clone().split(g_batch_gpu)]
         
-        cur_lr = 3.5e-3 #edm2_learning_rate_schedule(cur_nimg, **lr_scheduler)
-        cur_beta2 = 0.99 #cosine_decay_with_warmup(cur_nimg, **beta2_scheduler)
-        cur_gamma = 4 #cosine_decay_with_warmup(cur_nimg, **gamma_scheduler)
-        cur_aug_p = cosine_decay_with_warmup(cur_nimg, **aug_scheduler)
+        cur_lr = edm2_power_bridge_learning_rate_schedule(cur_nimg, **lr_scheduler)
+        cur_beta2 = beta2_from_exact_horizon_schedule(cur_nimg, **beta2_scheduler)
+        cur_gamma = log_linear_schedule(cur_nimg, **gamma_scheduler)
+        cur_aug_p = linear_schedule(cur_nimg, **aug_scheduler)
         
         if augment_pipe is not None:
             augment_pipe.p.copy_(misc.constant(cur_aug_p, device=device))
@@ -488,7 +1005,8 @@ def training_loop(
         fields = []
         fields += [f"tick {training_stats.report0('Progress/tick', cur_tick):<5d}"]
         fields += [f"kimg {training_stats.report0('Progress/kimg', cur_nimg / 1e3):<8.1f}"]
-        fields += [f"time {dnnlib.util.format_time(training_stats.report0('Timing/total_sec', tick_end_time - start_time)):<12s}"]
+        elapsed_total_sec = resume_time_offset + (tick_end_time - start_time)
+        fields += [f"time {dnnlib.util.format_time(training_stats.report0('Timing/total_sec', elapsed_total_sec)):<12s}"]
         fields += [f"sec/tick {training_stats.report0('Timing/sec_per_tick', tick_end_time - tick_start_time):<7.1f}"]
         fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}"]
         fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', maintenance_time):<6.1f}"]
@@ -500,8 +1018,8 @@ def training_loop(
         training_stats.report0('Progress/lr', cur_lr)
         training_stats.report0('Progress/beta2', cur_beta2)
         training_stats.report0('Progress/gamma', cur_gamma)
-        training_stats.report0('Timing/total_hours', (tick_end_time - start_time) / (60 * 60))
-        training_stats.report0('Timing/total_days', (tick_end_time - start_time) / (24 * 60 * 60))
+        training_stats.report0('Timing/total_hours', elapsed_total_sec / (60 * 60))
+        training_stats.report0('Timing/total_days', elapsed_total_sec / (24 * 60 * 60))
         if rank == 0:
             print(' '.join(fields))
 
@@ -513,11 +1031,11 @@ def training_loop(
                 print('Aborting...')
 
         # Save image snapshot.
-        if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
+        if False and (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
             images = torch.cat([encoder.decode(ema_preview(z, c)).cpu() for z, c in zip(grid_z, grid_c)]).to(torch.float).numpy()
             save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:09d}.png'), grid_size=grid_size)
 
-        if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
+        if False and (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
             for real_img, real_c, gen_z in zip(phase_real_img, phase_real_c, phase_gen_z):
                 with torch.no_grad():
                     for x in CollectGeneratorFeatures(G.Model, gen_z, real_c):
@@ -536,8 +1054,7 @@ def training_loop(
                 fname = f'ema-snapshot-{cur_nimg//1000:09d}{ema_suffix}.pkl'
                 if rank == 0:
                     print(f'Saving {fname} ... ', end='', flush=True)
-                    with open(os.path.join(run_dir, 'ema', fname), 'wb') as f:
-                        pickle.dump(data, f)
+                    atomic_pickle_dump(data, os.path.join(run_dir, 'ema', fname))
                     print('done')
                 del data # conserve memory
         
@@ -545,7 +1062,23 @@ def training_loop(
         snapshot_pkl = None
         snapshot_data = None
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
-            snapshot_data = dict(G=G, D=D, training_set_kwargs=dict(training_set_kwargs), eval_set_kwargs=dict(eval_set_kwargs), encoder_kwargs=dict(encoder_kwargs), cur_nimg=cur_nimg, **ema.state_dict())
+            snapshot_data = dict(
+                G=G,
+                D=D,
+                training_set_kwargs=dict(training_set_kwargs),
+                eval_set_kwargs=dict(eval_set_kwargs),
+                encoder_kwargs=dict(encoder_kwargs),
+                cur_nimg=cur_nimg,
+                cur_tick=cur_tick,
+                cur_tick_next=cur_tick + 1,
+                done=done,
+                batch_size=batch_size,
+                kimg_per_tick=kimg_per_tick,
+                network_snapshot_ticks=network_snapshot_ticks,
+                image_snapshot_ticks=image_snapshot_ticks,
+                ema_snapshot_ticks=ema_snapshot_ticks,
+                **ema.state_dict(),
+            )
             for phase in phases:
                 snapshot_data[phase.name + '_opt_state'] = remap_optimizer_state_dict(phase.opt.state_dict(), 'cpu')
             for key, value in snapshot_data.items():
@@ -559,11 +1092,16 @@ def training_loop(
                 del value # conserve memory
             snapshot_pkl = os.path.join(run_dir, 'snapshots', f'network-snapshot-{cur_nimg//1000:09d}.pkl')
             if rank == 0:
-                with open(snapshot_pkl, 'wb') as f:
-                    pickle.dump(snapshot_data, f)
+                atomic_pickle_dump(snapshot_data, snapshot_pkl)
 
         # Evaluate metrics.
-        if (snapshot_data is not None) and (len(metrics) > 0):
+        already_evaluated_resume_snapshot = (
+            resume_run
+            and resume_pkl is not None
+            and snapshot_pkl is not None
+            and os.path.abspath(snapshot_pkl) == os.path.abspath(resume_pkl)
+        )
+        if False and (snapshot_data is not None) and (len(metrics) > 0) and (not already_evaluated_resume_snapshot):
             if rank == 0:
                 print('Evaluating metrics...')
             for metric in metrics:
@@ -592,7 +1130,7 @@ def training_loop(
             stats_jsonl.flush()
         if stats_tfevents is not None:
             global_step = int(cur_nimg / 1e3)
-            walltime = timestamp - start_time
+            walltime = resume_time_offset + (timestamp - start_time)
             for name, value in stats_dict.items():
                 stats_tfevents.add_scalar(name, value.mean, global_step=global_step, walltime=walltime)
             for name, value in stats_metrics.items():

@@ -226,26 +226,19 @@ class UpsampleLayer(nn.Module):
         self.Resampler = InterpolativeUpsampler(ResamplingFilter)
 
     def forward(self, x, Gain):
-        x = x * Gain.view(1, -1, 1, 1).to(x.dtype)
-        return self.Resampler(x)
+        return self.Resampler(x, channel_gain=Gain)
 
     def forward_with_cache(self, x, Gain):
-        gain = Gain.view(1, -1, 1, 1).to(x.dtype)
-        z = x * gain
-        y = self.Resampler(z)
+        y = self.Resampler(x, channel_gain=Gain)
         cache = dict(
             x_shape=x.shape,
-            z_shape=z.shape,
             y_shape=y.shape,
             Gain=Gain,
-            gain=gain,
         )
         return y, cache
 
     def explicit_vjp(self, v, cache):
-        v = self.Resampler.explicit_vjp(v, input_shape=cache['z_shape'])
-        v = v * cache['gain'].to(v.dtype)
-        return v
+        return self.Resampler.explicit_vjp(v, input_shape=cache['x_shape'], channel_gain=cache['Gain'])
 
 
 class DownsampleLayer(nn.Module):
@@ -257,26 +250,19 @@ class DownsampleLayer(nn.Module):
         self.Resampler = InterpolativeDownsampler(ResamplingFilter)
 
     def forward(self, x, Gain):
-        x = self.Resampler(x * Gain.view(1, -1, 1, 1).to(x.dtype))
-        return x
+        return self.Resampler(x, channel_gain=Gain)
 
     def forward_with_cache(self, x, Gain):
-        gain = Gain.view(1, -1, 1, 1).to(x.dtype)
-        z = x * gain
-        y = self.Resampler(z)
+        y = self.Resampler(x, channel_gain=Gain)
         cache = dict(
             x_shape=x.shape,
-            z_shape=z.shape,
             y_shape=y.shape,
             Gain=Gain,
-            gain=gain,
         )
         return y, cache
 
     def explicit_vjp(self, v, cache):
-        v = self.Resampler.explicit_vjp(v, input_shape=cache['z_shape'])
-        v = v * cache['gain'].to(v.dtype)
-        return v
+        return self.Resampler.explicit_vjp(v, input_shape=cache['x_shape'], channel_gain=cache['Gain'])
 
 
 class GenerativeHead(nn.Module):
@@ -294,6 +280,10 @@ class GenerativeHead(nn.Module):
         y = self.LinearLayer2(self.NonLinearity(y))
         y = self.LinearLayer3(self.NonLinearity(y))
 
+        # Move the NCHW -> NHWC boundary into the head: the basis/1x1
+        # island remains NCHW, but the head upsample itself now runs on
+        # channels_last and the entire generator trunk stays channels_last.
+        y = ToChannelsLast(y)
         return self.Resampler(y)
 
 
@@ -308,7 +298,14 @@ class DiscriminativeHead(nn.Module):
         self.Resampler = InterpolativeDownsampler(ResamplingFilter)
 
     def forward(self, x, Gain):
-        y = self.LinearLayer1(self.Resampler(x), Gain=Gain.view(1, -1, 1, 1))
+        # Move the NHWC -> NCHW boundary into the head.  The final residual
+        # stage supplies channels_last activations; the head downsample keeps
+        # that layout and folds Gain into the resampler.  We then switch to
+        # NCHW for the 4x4 basis/linear head island.
+        x = ToChannelsLast(x)
+        y = self.Resampler(x, channel_gain=Gain)
+        y = ToNCHWContiguous(y)
+        y = self.LinearLayer1(y)
         y = self.LinearLayer2(self.NonLinearity(y))
         y = self.LinearLayer3(self.NonLinearity(y))
 
@@ -317,13 +314,18 @@ class DiscriminativeHead(nn.Module):
     def forward_with_cache(self, x, Gain):
         """Forward with cache for explicit VJP.
 
-        Normal forward() is unchanged. This helper is for full-discriminator
-        explicit R1 only.
-        """
-        gain = Gain.view(1, -1, 1, 1)
+        Forward order is intentionally identical to forward():
+            x_cl -> Resampler(channel_gain=Gain) -> NCHW copy
+                 -> unbiased 1x1 -> lrelu -> basis -> lrelu -> linear.
 
-        r = self.Resampler(x)
-        y1 = self.LinearLayer1(r, Gain=gain)
+        In particular, Gain is not also passed to LinearLayer1.  This keeps the
+        gain application boundary consistent between ordinary forward and the
+        explicit VJP path.
+        """
+        x = ToChannelsLast(x)
+        r_cl = self.Resampler(x, channel_gain=Gain)
+        r = ToNCHWContiguous(r_cl)
+        y1 = self.LinearLayer1(r)
         a1 = self.NonLinearity(y1)
 
         y2 = self.LinearLayer2(a1)
@@ -333,14 +335,10 @@ class DiscriminativeHead(nn.Module):
 
         cache = dict(
             x=x,
+            x_shape=x.shape,
             Gain=Gain,
-            gain=gain,
-            r=r,
             y1=y1,
-            a1=a1,
             y2=y2,
-            a2=a2,
-            y3=y3,
         )
         return y3, cache
 
@@ -348,10 +346,11 @@ class DiscriminativeHead(nn.Module):
         """Explicit VJP through the discriminator head.
 
         Head forward:
-            x -> Resampler -> biased 1x1 -> lrelu -> DiscriminativeBasis
-              -> lrelu -> Linear
+            x_cl -> Resampler(channel_gain=Gain) -> NCHW copy
+                 -> biased 1x1 -> lrelu -> DiscriminativeBasis
+                 -> lrelu -> Linear.
 
-        This returns the cotangent wrt x.
+        This returns the cotangent wrt the channels_last head input x_cl.
         """
         # LinearLayer3: forward is a2 @ w.T.
         w3 = self.LinearLayer3.EffectiveWeight(v.dtype)
@@ -363,7 +362,7 @@ class DiscriminativeHead(nn.Module):
         # DiscriminativeBasis VJP.
         # Forward: Basis(a1).view(B, -1), where Basis output is [B, C, 1, 1].
         basis = self.LinearLayer2.Basis
-        w2 = basis.EffectiveWeight(cache['a1'].dtype)
+        w2 = basis.EffectiveWeight(v.dtype)
         v = v.view(v.shape[0], w2.shape[0], 1, 1)
         v = F.conv_transpose2d(
             v,
@@ -375,17 +374,22 @@ class DiscriminativeHead(nn.Module):
         # Activation 1. Shape: [B, hidden, 4, 4].
         v = v * self.NonLinearity.Slope(cache['y1']).to(v.dtype)
 
-        # Biased pointwise convolution VJP; bias has no input VJP.
-        w1, _ = self.LinearLayer1.EffectiveWeightBias(v.dtype, Gain=cache['gain'])
+        # Biased pointwise convolution VJP; bias has no input VJP.  Gain was
+        # folded into the resampler in forward_with_cache(), so do not apply it
+        # again in the 1x1 VJP.
+        w1, _ = self.LinearLayer1.EffectiveWeightBias(v.dtype)
         v = F.conv_transpose2d(v, w1)
 
-        # Resampler VJP: 4x4 -> 8x8.
-        v = self.Resampler.explicit_vjp(v, input_shape=cache['x'].shape)
+        # VJP through the NCHW copy boundary back to the resampler output.
+        v = ToChannelsLast(v)
+
+        # Resampler VJP: 4x4 -> 8x8, with exactly the same channel_gain boundary
+        # as the forward path.
+        v = self.Resampler.explicit_vjp(v, input_shape=cache['x_shape'], channel_gain=cache['Gain'])
 
         if KeepInputDependency:
             v = v + cache['x'] * 0
         return v
-
 
 def BuildResidualGroups(WidthPerStage, BlocksPerStage, FFNFirstConvolutionType, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize):
     ResidualGroups = []
@@ -423,17 +427,14 @@ class Generator(nn.Module):
     def forward(self, x, y=None):
         x = torch.cat([x, self.EmbeddingLayer(y)], dim=1) if hasattr(self, 'EmbeddingLayer') else x
 
-        # Generator head is the NCHW island.
-        x = ToNCHWContiguous(self.Head(x).to(torch.bfloat16))
-
-        # Everything after the head runs NHWC/channels-last, including
-        # residual groups, resampling transitions, and aggregation.
-        x = ToChannelsLast(x)
+        # The head performs its own NCHW -> NHWC transition immediately before
+        # the head upsample; everything after the head runs channels_last.
+        x = ToChannelsLast(self.Head(x).to(torch.bfloat16))
 
         for Layer, Transition in zip(self.MainLayers[:-1], self.TransitionLayers):
             x, AccumulatedVariance = Layer(x)
-            x = Transition(x, Gain=torch.rsqrt(AccumulatedVariance))
             x = ToChannelsLast(x)
+            x = Transition(x, Gain=torch.rsqrt(AccumulatedVariance))
 
         x, AccumulatedVariance = self.MainLayers[-1](x)
 
@@ -478,14 +479,14 @@ class Discriminator(nn.Module):
         # Residual groups and downsample transitions run NHWC/channels-last.
         for Layer, Transition in zip(self.MainLayers[:-1], self.TransitionLayers):
             x, AccumulatedVariance = Layer(x)
-            x = Transition(x, Gain=torch.rsqrt(AccumulatedVariance))
             x = ToChannelsLast(x)
+            x = Transition(x, Gain=torch.rsqrt(AccumulatedVariance))
 
         x, AccumulatedVariance = self.MainLayers[-1](x)
 
-        # Discriminator head/resampler/basis is the NCHW island.
-        x = ToNCHWContiguous(x)
-        x = self.Head(x.to(torch.float32), Gain=torch.rsqrt(AccumulatedVariance))
+        # The head performs its own NHWC -> NCHW transition immediately after
+        # the head downsample.  Keep the resampler input channels_last.
+        x = self.Head(ToChannelsLast(x.to(torch.float32)), Gain=torch.rsqrt(AccumulatedVariance))
         x = (x * y / math.sqrt(y.shape[1])).sum(dim=1, keepdim=True) if hasattr(self, 'EmbeddingLayer') else x
 
         return x.view(x.shape[0])
@@ -516,9 +517,12 @@ class Discriminator(nn.Module):
         and for wrappers/tests.
         """
         for Index in range(StageIndex, len(self.TransitionLayers)):
-            # Transition/downsample also runs NHWC/channels-last.
-            x = self.TransitionLayers[Index](x, Gain=torch.rsqrt(AccumulatedVariance))
+            # Transition/downsample dispatch requires NHWC/channels_last input to
+            # hit the modern optimized plugin.  The modern plugin preserves the
+            # suggested memory format, so the old post-transition ToChannelsLast()
+            # was redundant.
             x = ToChannelsLast(x)
+            x = self.TransitionLayers[Index](x, Gain=torch.rsqrt(AccumulatedVariance))
 
             Layer = self.MainLayers[Index + 1]
             if UseCompiled:
@@ -529,9 +533,9 @@ class Discriminator(nn.Module):
                 else:
                     x, AccumulatedVariance = Layer(x)
 
-        # Head island is NCHW.
-        x = ToNCHWContiguous(x)
-        x = self.Head(x.to(torch.float32), Gain=torch.rsqrt(AccumulatedVariance))
+        # The head performs its own NHWC -> NCHW transition immediately after
+        # the head downsample.  Keep the resampler input channels_last.
+        x = self.Head(ToChannelsLast(x.to(torch.float32)), Gain=torch.rsqrt(AccumulatedVariance))
         x = (x * y / math.sqrt(y.shape[1])).sum(dim=1, keepdim=True) if hasattr(self, 'EmbeddingLayer') else x
         return x.view(x.shape[0])
 
@@ -598,8 +602,8 @@ class Discriminator(nn.Module):
         for Index, Transition in enumerate(self.TransitionLayers):
             TransitionGain = torch.rsqrt(AccumulatedVariance)
 
-            x, TransitionCache = Transition.forward_with_cache(x, Gain=TransitionGain)
             x = ToChannelsLast(x)
+            x, TransitionCache = Transition.forward_with_cache(x, Gain=TransitionGain)
             TransitionCaches.append(TransitionCache)
 
             x, AccumulatedVariance, Caches = self.MainLayers[Index + 1].forward_with_cache(x)
@@ -607,10 +611,12 @@ class Discriminator(nn.Module):
             StageCaches.append(Caches)
             AccumulatedVariances.append(AccumulatedVariance)
 
-        # Head is the NCHW island.
-        HeadInput = ToNCHWContiguous(x)
+        # Head consumes the final residual activation in channels_last layout.
+        # The head itself downsamples first, then switches to NCHW for the
+        # 4x4 basis/linear island.
+        FinalStageOutput = ToChannelsLast(x)
         HeadOut, HeadCache = self.Head.forward_with_cache(
-            HeadInput.to(torch.float32),
+            ToChannelsLast(FinalStageOutput.to(torch.float32)),
             Gain=torch.rsqrt(AccumulatedVariance),
         )
 
@@ -619,6 +625,7 @@ class Discriminator(nn.Module):
 
         Cache = dict(
             StageOutputs=StageOutputs,
+            FinalStageOutput=FinalStageOutput,
             StageCaches=StageCaches,
             TransitionCaches=TransitionCaches,
             AccumulatedVariances=AccumulatedVariances,
@@ -634,8 +641,8 @@ class Discriminator(nn.Module):
         This explicitly handles all MainLayers and TransitionLayers.
 
         Important dtype/layout note:
-            The discriminator head runs on ``FinalStageOutput.to(torch.float32)``.
-            Autograd's VJP through that cast returns a cotangent in the dtype of
+            The discriminator head runs on ``FinalStageOutput.to(torch.float32)`` in channels_last layout.
+            Autograd's VJP through that dtype/layout boundary returns a cotangent in the dtype of
             ``FinalStageOutput`` (normally bfloat16).  The explicit head VJP,
             however, naturally produces float32.  If we pass that float32
             cotangent into the residual-stage VJP, the large 8/16/32-resolution
@@ -669,9 +676,12 @@ class Discriminator(nn.Module):
 
         # Walk backward through transition + previous residual stage.
         for Index in reversed(range(len(self.TransitionLayers))):
-            # Transitions also run NHWC/channels-last.
-            v = self.TransitionLayers[Index].explicit_vjp(v, TransitionCaches[Index])
+            # Transition VJP dispatch requires NHWC/channels_last input to hit the
+            # modern optimized plugin.  The modern plugin allocates its output with
+            # x.suggest_memory_format(), so its output remains channels_last; an
+            # additional ToChannelsLast() after the transition would be redundant.
             v = ToChannelsLast(v)
+            v = self.TransitionLayers[Index].explicit_vjp(v, TransitionCaches[Index])
             v = self.MainLayers[Index].explicit_vjp_from_cache(
                 v,
                 StageCaches[Index],
@@ -708,9 +718,9 @@ class Discriminator(nn.Module):
         # The head forward consumes the final residual activation after casting
         # it to float32:
         #
-        #     Head(FinalStageOutput.to(torch.float32), ...)
+        #     Head(FinalStageOutput.to(torch.float32), ...)  # channels_last
         #
-        # Autograd's VJP through that cast returns a cotangent in the dtype of
+        # Autograd's VJP through that dtype/layout boundary returns a cotangent in the dtype of
         # FinalStageOutput, usually bfloat16.  The explicit head VJP naturally
         # produces float32 because the head runs in float32, so cast it back
         # before entering the large residual-stage VJP.  Otherwise stages 0/1/2

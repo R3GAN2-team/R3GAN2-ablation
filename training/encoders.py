@@ -128,7 +128,7 @@ class StabilityVAEEncoder(Encoder):
         x = x - misc.const_like(x, self.bias).reshape(1, -1, 1, 1)
         x = x / misc.const_like(x, self.scale).reshape(1, -1, 1, 1)
         x = torch.cat([self._run_vae_decoder(batch) for batch in x.split(self.batch_size)])
-        x = x.clamp(0, 1).mul(255).to(torch.uint8)
+        x = x.mul(255).add(0.5).floor().clamp(0, 255).to(torch.uint8)
         return x
 
 #----------------------------------------------------------------------------
@@ -225,7 +225,7 @@ class Flux2VAEEncoder(Encoder):
         x = x - misc.const_like(x, self.bias).reshape(1, -1, 1, 1)
         x = x / misc.const_like(x, self.scale).reshape(1, -1, 1, 1)
         x = torch.cat([self._run_vae_decoder(batch) for batch in x.split(self.batch_size)])
-        x = (x / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8)
+        x = (x / 2 + 0.5).mul(255).add(0.5).floor().clamp(0, 255).to(torch.uint8)
         return x
     
 #----------------------------------------------------------------------------

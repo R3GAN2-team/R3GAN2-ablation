@@ -11,6 +11,8 @@ import click
 import re
 import json
 import tempfile
+import signal
+import psutil
 import torch
 
 import dnnlib
@@ -21,7 +23,140 @@ from torch_utils import custom_ops
 
 #----------------------------------------------------------------------------
 
+def _parse_resume_arg(resume):
+    """Return ('none'|'auto'|'pkl', value) for --resume."""
+    if resume is None:
+        return 'none', None
+
+    s = str(resume).strip()
+    if s == '':
+        return 'none', None
+
+    sl = s.lower()
+    if sl in ['0', 'false', 'no', 'off', 'none']:
+        return 'none', None
+    if sl in ['1', 'true', 'yes', 'on']:
+        return 'auto', None
+
+    return 'pkl', s
+
+
+def _collect_numbered_run_dirs(outdir):
+    if not os.path.isdir(outdir):
+        return []
+
+    run_dirs = []
+    for name in os.listdir(outdir):
+        path = os.path.join(outdir, name)
+        if not os.path.isdir(path):
+            continue
+        match = re.match(r'^(\d+)', name)
+        if match is None:
+            continue
+        run_dirs.append((int(match.group(1)), name, path))
+
+    run_dirs.sort(key=lambda x: (x[0], x[1]))
+    return run_dirs
+
+
+def _find_latest_run_dir(outdir):
+    run_dirs = _collect_numbered_run_dirs(outdir)
+    if len(run_dirs) == 0:
+        return None
+    return run_dirs[-1][2]
+
+
+
+def _set_parent_death_signal():
+    """Ask Linux to SIGTERM this process if its parent launcher dies."""
+    if os.name != 'posix':
+        return
+    try:
+        import ctypes
+        libc = ctypes.CDLL('libc.so.6')
+        PR_SET_PDEATHSIG = 1
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+    except Exception:
+        pass
+
+
+def _collect_process_tree(extra_pids=None):
+    """Collect launcher children and optional extra PID subtrees."""
+    procs = []
+    seen = set()
+
+    def add_proc(proc):
+        try:
+            pid = proc.pid
+        except psutil.NoSuchProcess:
+            return
+        if pid == os.getpid() or pid in seen:
+            return
+        seen.add(pid)
+        procs.append(proc)
+        try:
+            children = proc.children(recursive=True)
+        except psutil.NoSuchProcess:
+            children = []
+        for child in children:
+            add_proc(child)
+
+    try:
+        parent = psutil.Process(os.getpid())
+        for child in parent.children(recursive=True):
+            add_proc(child)
+    except psutil.NoSuchProcess:
+        pass
+
+    for pid in extra_pids or []:
+        try:
+            add_proc(psutil.Process(pid))
+        except psutil.NoSuchProcess:
+            pass
+
+    return procs
+
+
+def _terminate_process_tree(extra_pids=None, term_timeout=10, kill_timeout=5, hard=False):
+    """Terminate all child processes, or SIGKILL them immediately if hard=True."""
+    procs = _collect_process_tree(extra_pids=extra_pids)
+    if len(procs) == 0:
+        return
+
+    if hard:
+        print(f'Killing {len(procs)} child processes...', flush=True)
+        for proc in procs:
+            try:
+                proc.kill()
+            except psutil.NoSuchProcess:
+                pass
+        psutil.wait_procs(procs, timeout=kill_timeout)
+        return
+
+    print(f'Terminating {len(procs)} child processes...', flush=True)
+    for proc in procs:
+        try:
+            proc.terminate()
+        except psutil.NoSuchProcess:
+            pass
+
+    _gone, alive = psutil.wait_procs(procs, timeout=term_timeout)
+    if len(alive) == 0:
+        return
+
+    print(f'{len(alive)} child processes did not terminate; killing...', flush=True)
+    for proc in alive:
+        try:
+            proc.kill()
+        except psutil.NoSuchProcess:
+            pass
+    psutil.wait_procs(alive, timeout=kill_timeout)
+
 def subprocess_fn(rank, c, temp_dir):
+    if c.num_gpus > 1:
+        _set_parent_death_signal()
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
 
     # Init torch.distributed.
@@ -41,7 +176,14 @@ def subprocess_fn(rank, c, temp_dir):
         custom_ops.verbosity = 'none'
 
     # Execute training loop.
-    training_loop.training_loop(rank=rank, **c)
+    try:
+        training_loop.training_loop(rank=rank, **c)
+    finally:
+        if c.num_gpus > 1 and torch.distributed.is_initialized():
+            try:
+                torch.distributed.destroy_process_group()
+            except Exception:
+                pass
 
 #----------------------------------------------------------------------------
 
@@ -49,14 +191,25 @@ def launch_training(c, desc, outdir, dry_run):
     dnnlib.util.Logger(should_flush=True)
 
     # Pick output directory.
-    prev_run_dirs = []
-    if os.path.isdir(outdir):
-        prev_run_dirs = [x for x in os.listdir(outdir) if os.path.isdir(os.path.join(outdir, x))]
-    prev_run_ids = [re.match(r'^\d+', x) for x in prev_run_dirs]
-    prev_run_ids = [int(x.group()) for x in prev_run_ids if x is not None]
-    cur_run_id = max(prev_run_ids, default=-1) + 1
-    c.run_dir = os.path.join(outdir, f'{cur_run_id:05d}-{desc}')
-    assert not os.path.exists(c.run_dir)
+    resume_auto = getattr(c, 'resume_dir', None) == 'auto'
+
+    if resume_auto:
+        latest_run_dir = _find_latest_run_dir(outdir)
+        if latest_run_dir is not None:
+            c.run_dir = latest_run_dir
+            c.resume_dir = c.run_dir
+            assert os.path.isdir(c.run_dir)
+        else:
+            print(f'WARNING: --resume=1 was specified, but no previous run directories were found in "{outdir}". Starting a new run instead.')
+            resume_auto = False
+            if 'resume_dir' in c:
+                del c.resume_dir
+
+    if not resume_auto:
+        prev_run_ids = [run_id for run_id, _name, _path in _collect_numbered_run_dirs(outdir)]
+        cur_run_id = max(prev_run_ids, default=-1) + 1
+        c.run_dir = os.path.join(outdir, f'{cur_run_id:05d}-{desc}')
+        assert not os.path.exists(c.run_dir)
 
     # Print options.
     print()
@@ -64,6 +217,10 @@ def launch_training(c, desc, outdir, dry_run):
     print(json.dumps(c, indent=2))
     print()
     print(f'Output directory:    {c.run_dir}')
+    if resume_auto:
+        print(f'Resume directory:    {c.resume_dir}')
+    elif getattr(c, 'resume_pkl', None) is not None:
+        print(f'Resume checkpoint:   {c.resume_pkl}')
     print(f'Number of GPUs:      {c.num_gpus}')
     print(f'Batch size:          {c.batch_size} images')
     print(f'Training duration:   {c.total_kimg} kimg')
@@ -79,20 +236,72 @@ def launch_training(c, desc, outdir, dry_run):
         print('Dry run; exiting.')
         return
 
-    # Create output directory.
-    print('Creating output directory...')
-    os.makedirs(c.run_dir)
-    with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
-        json.dump(c, f, indent=2)
+    # Create output directory for new runs. In-place resume reuses the existing
+    # run directory and lets training_loop append/truncate logs as needed.
+    if resume_auto:
+        print('Reusing output directory...')
+    else:
+        print('Creating output directory...')
+        os.makedirs(c.run_dir)
+        with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
+            json.dump(c, f, indent=2)
 
     # Launch processes.
     print('Launching processes...')
     torch.multiprocessing.set_start_method('spawn')
     with tempfile.TemporaryDirectory() as temp_dir:
         if c.num_gpus == 1:
-            subprocess_fn(rank=0, c=c, temp_dir=temp_dir)
+            def hard_shutdown_single(signum, frame):
+                print(f'\nReceived signal {signum}; killing child processes now...', flush=True)
+                _terminate_process_tree(kill_timeout=3, hard=True)
+                os._exit(128 + signum)
+
+            old_sigint = signal.signal(signal.SIGINT, hard_shutdown_single)
+            old_sigterm = signal.signal(signal.SIGTERM, hard_shutdown_single)
+            try:
+                subprocess_fn(rank=0, c=c, temp_dir=temp_dir)
+            finally:
+                signal.signal(signal.SIGINT, old_sigint)
+                signal.signal(signal.SIGTERM, old_sigterm)
         else:
-            torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir), nprocs=c.num_gpus)
+            ctx = None
+            shutdown_started = False
+
+            def worker_pids():
+                if ctx is None:
+                    return []
+                return [proc.pid for proc in ctx.processes if proc.pid is not None]
+
+            def hard_shutdown(signum, frame):
+                print(f'\nReceived signal {signum} again; killing workers immediately...', flush=True)
+                _terminate_process_tree(extra_pids=worker_pids(), kill_timeout=3, hard=True)
+                os._exit(128 + signum)
+
+            def request_shutdown(signum, frame):
+                nonlocal shutdown_started
+                if shutdown_started:
+                    hard_shutdown(signum, frame)
+
+                shutdown_started = True
+                signal.signal(signal.SIGINT, hard_shutdown)
+                signal.signal(signal.SIGTERM, hard_shutdown)
+
+                print(f'\nReceived signal {signum}; killing workers now...', flush=True)
+                _terminate_process_tree(extra_pids=worker_pids(), kill_timeout=3, hard=True)
+                os._exit(128 + signum)
+
+            old_sigint = signal.signal(signal.SIGINT, request_shutdown)
+            old_sigterm = signal.signal(signal.SIGTERM, request_shutdown)
+            try:
+                ctx = torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir), nprocs=c.num_gpus, join=False)
+                while not ctx.join(timeout=1):
+                    pass
+            finally:
+                signal.signal(signal.SIGINT, old_sigint)
+                signal.signal(signal.SIGTERM, old_sigterm)
+                if shutdown_started:
+                    _terminate_process_tree(extra_pids=worker_pids(), kill_timeout=3, hard=True)
+
 
 #----------------------------------------------------------------------------
 
@@ -162,7 +371,7 @@ def parse_comma_separated_list(s):
 @click.option('--cond',         help='Train conditional model', metavar='BOOL',                 type=bool, default=False, show_default=True)
 @click.option('--mirror',       help='Enable dataset x-flips', metavar='BOOL',                  type=bool, default=False, show_default=True)
 @click.option('--aug',          help='Enable Augmentation', metavar='BOOL',                     type=bool, default=True, show_default=True)
-@click.option('--resume',       help='Resume from given network pickle', metavar='[PATH|URL]',  type=str)
+@click.option('--resume',       help='Resume from network pickle, or --resume=1 to resume latest run in --outdir', metavar='[PATH|URL|BOOL]', type=str)
 
 # Misc hyperparameters.
 @click.option('--g-batch-gpu',  help='Limit batch size per GPU for G', metavar='INT',           type=click.IntRange(min=1))
@@ -223,27 +432,44 @@ def main(**kwargs):
        
         decay_nimg = 2e7
        
-        c.aug_scheduler = { 'base_value': 0, 'final_value': 0.55, 'total_nimg': decay_nimg }
-        c.lr_scheduler = { 'batch_size': 512, 'ref_lr': 100e-4, 'ref_batches': 1e3, 'rampup_Mimg': 1 }
-        c.gamma_scheduler = { 'base_value': 0.05, 'final_value': 0.005, 'total_nimg': decay_nimg }
-        c.beta2_scheduler = { 'base_value': 0.9, 'final_value': 0.99, 'total_nimg': decay_nimg }
-
-    if opts.preset == 'ImageNet-Ablation':
+        c.aug_scheduler = { 'base_value': 0, 'final_value': 0.55, 'total_nimg': decay_nimg, 'rampup_Mimg': 1 }
+        c.lr_scheduler = { 'batch_size': 512, 'max_lr': 1e-2, 'ref_lr': 2e-3, 'ref_batches': 23000.0, 'early_decay_mult': 8.0, 'total_nimg': decay_nimg, 'rampup_Mimg': 1 }
+        c.gamma_scheduler = { 'base_value': 0.01 / 4, 'final_value': 0.01, 'total_nimg': decay_nimg, 'rampup_Mimg': 1 }
+        c.beta2_scheduler = { 'start_beta2': 0.9, 'final_beta2': 0.99, 'total_nimg': decay_nimg, 'rampup_Mimg': 1 }
+    
+    if opts.preset == 'ImageNet-1x':
         WidthPerStage = [x // 2 for x in [1024, 1024, 1024]]
         BlocksPerStage = [['FFN', 'FFN', 'FFN', 'FFN'], ['FFN', 'FFN', 'FFN', 'FFN'], ['FFN', 'FFN', 'FFN', 'FFN']]
         NoiseDimension = 64
         aug_config = dict(rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, cutout=1)
-        ema_stds = [0.050, 0.100, 0.200, 0.300]
+        ema_stds = [0.050, 0.100, 0.150, 0.200]
        
         c.G_kwargs.ClassEmbeddingDimension = NoiseDimension
         c.D_kwargs.ClassEmbeddingDimension = WidthPerStage[0]
        
-        decay_nimg = 2e8 / 2
+        decay_nimg = 2e8
        
-        c.aug_scheduler = { 'base_value': 0, 'final_value': 0.3, 'total_nimg': decay_nimg }
-        c.lr_scheduler = { 'batch_size': 4096, 'ref_lr': 50e-4, 'ref_batches': 70000, 'rampup_Mimg': 10 }
-        c.gamma_scheduler = { 'base_value': 5, 'final_value': 0.5, 'total_nimg': decay_nimg }
-        c.beta2_scheduler = { 'base_value': 0.9, 'final_value': 0.9, 'total_nimg': decay_nimg }
+        c.aug_scheduler = { 'base_value': 0, 'final_value': 0.3, 'total_nimg': decay_nimg, 'rampup_Mimg': 10 }
+        c.lr_scheduler = { 'batch_size': 4096, 'max_lr': 1e-2, 'ref_lr': 4e-3, 'ref_batches': 251116.071429, 'early_decay_mult': 5, 'total_nimg': decay_nimg, 'rampup_Mimg': 10 }
+        c.gamma_scheduler = { 'base_value': 2/4, 'final_value': 2, 'total_nimg': decay_nimg, 'rampup_Mimg': 10 }
+        c.beta2_scheduler = { 'start_beta2': 0.9, 'final_beta2': 0.95, 'total_nimg': decay_nimg, 'rampup_Mimg': 10 }  
+    
+    if opts.preset == 'ImageNet-2x':
+        WidthPerStage = [x for x in [1024, 1024, 1024]]
+        BlocksPerStage = [['FFN', 'FFN', 'FFN', 'FFN'], ['FFN', 'FFN', 'FFN', 'FFN'], ['FFN', 'FFN', 'FFN', 'FFN']]
+        NoiseDimension = 64
+        aug_config = dict(rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, cutout=1)
+        ema_stds = [0.050, 0.100, 0.150, 0.200]
+       
+        c.G_kwargs.ClassEmbeddingDimension = NoiseDimension
+        c.D_kwargs.ClassEmbeddingDimension = WidthPerStage[0]
+       
+        decay_nimg = 2e8
+       
+        c.aug_scheduler = { 'base_value': 0, 'final_value': 0.3, 'total_nimg': decay_nimg, 'rampup_Mimg': 10 }
+        c.lr_scheduler = { 'batch_size': 4096, 'max_lr': 1e-2, 'ref_lr': 2.5e-3, 'ref_batches': 251116.071429, 'early_decay_mult': 8, 'total_nimg': decay_nimg, 'rampup_Mimg': 10 }
+        c.gamma_scheduler = { 'base_value': 1, 'final_value': 4, 'total_nimg': decay_nimg, 'rampup_Mimg': 10 }
+        c.beta2_scheduler = { 'start_beta2': 0.9, 'final_beta2': 0.95, 'total_nimg': decay_nimg, 'rampup_Mimg': 10 }
 
     c.G_kwargs.NoiseDimension = NoiseDimension
     c.G_kwargs.WidthPerStage = WidthPerStage
@@ -281,8 +507,11 @@ def main(**kwargs):
     c.ema_kwargs = dnnlib.EasyDict(class_name='training.phema.PowerFunctionEMA', stds=ema_stds)
 
     # Resume.
-    if opts.resume is not None:
-        c.resume_pkl = opts.resume
+    resume_mode, resume_value = _parse_resume_arg(opts.resume)
+    if resume_mode == 'auto':
+        c.resume_dir = 'auto'
+    elif resume_mode == 'pkl':
+        c.resume_pkl = resume_value
 
     # Performance-related toggles.
     if opts.nobench:

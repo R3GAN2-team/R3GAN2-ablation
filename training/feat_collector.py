@@ -1,34 +1,45 @@
 import torch
 
+
+def _to_channels_last(x):
+    if isinstance(x, torch.Tensor) and x.ndim == 4:
+        return x.contiguous(memory_format=torch.channels_last)
+    return x
+
+
 def CollectGeneratorFeatures(Generator, x, y):
     x = torch.cat([x, Generator.EmbeddingLayer(y)], dim=1) if hasattr(Generator, 'EmbeddingLayer') else x
-    x = Generator.Head(x).to(torch.bfloat16)
+    x = _to_channels_last(Generator.Head(x).to(torch.bfloat16))
     f = []
-        
+
     for Layer, Transition in zip(Generator.MainLayers[:-1], Generator.TransitionLayers):
         x, AccumulatedVariance = Layer(x)
         f += [x * torch.rsqrt(AccumulatedVariance).view(1, -1, 1, 1).to(x.dtype)]
+        x = _to_channels_last(x)
         x = Transition(x, Gain=torch.rsqrt(AccumulatedVariance))
     x, AccumulatedVariance = Generator.MainLayers[-1](x)
     f += [x * torch.rsqrt(AccumulatedVariance).view(1, -1, 1, 1).to(x.dtype)]
 
     return f
 
+
 def CollectDiscriminatorFeatures(Discriminator, x, y):
-    x = Discriminator.ExtractionLayer(x.to(torch.bfloat16))
+    x = _to_channels_last(Discriminator.ExtractionLayer(x.to(torch.bfloat16)))
     f = []
-    
+
     for Layer, Transition in zip(Discriminator.MainLayers[:-1], Discriminator.TransitionLayers):
         x, AccumulatedVariance = Layer(x)
         f += [x * torch.rsqrt(AccumulatedVariance).view(1, -1, 1, 1).to(x.dtype)]
+        x = _to_channels_last(x)
         x = Transition(x, Gain=torch.rsqrt(AccumulatedVariance))
     x, AccumulatedVariance = Discriminator.MainLayers[-1](x)
     f += [x * torch.rsqrt(AccumulatedVariance).view(1, -1, 1, 1).to(x.dtype)]
-    
+
     return f
 
+
 def CollectMagnitude(x, mode='avg'):
-    x = x.view(x.shape[0], x.shape[1], -1)
+    x = x.reshape(x.shape[0], x.shape[1], -1)
     M = x.shape[2]
     x = torch.sqrt(x.square().sum(dim=2) / M)
     if mode == 'avg':
